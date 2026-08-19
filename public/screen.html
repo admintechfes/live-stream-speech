@@ -112,9 +112,13 @@
   let ws = null
   let backoff = 500
 
+  // Derived from this page's own URL, not hardcoded — works whether this app
+  // is mounted at the domain root or under a path prefix like /live-stream/.
+  const BASE = location.pathname.replace(/[^/]*$/, '')
+
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    ws = new WebSocket(`${proto}://${location.host}/ws?role=screen&hall=${encodeURIComponent(hall)}`)
+    ws = new WebSocket(`${proto}://${location.host}${BASE}ws?role=screen&hall=${encodeURIComponent(hall)}`)
 
     ws.onopen = () => { backoff = 500; $dot.classList.remove('down') }
 

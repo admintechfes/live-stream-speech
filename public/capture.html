@@ -82,7 +82,7 @@
     <div id="log"></div>
   </div>
 
-<script src="/vendor/speech-sdk.js" onerror="this.dataset.failed=1"></script>
+<script src="vendor/speech-sdk.js" onerror="this.dataset.failed=1"></script>
 <script>
 window.SPEECH_SDK_FALLBACK = !window.SpeechSDK
 </script>
@@ -111,6 +111,10 @@ if (window.SPEECH_SDK_FALLBACK) {
     return
   }
 
+  // Derived from this page's own URL — works mounted at root or under a path
+  // prefix like /live-stream/ without any nginx-side path rewriting.
+  const BASE = location.pathname.replace(/[^/]*$/, '')
+
   let cfg = null          // { region, sourceLanguages, targetLanguage, phraseList }
   let ws = null
   let wsBackoff = 500
@@ -126,7 +130,7 @@ if (window.SPEECH_SDK_FALLBACK) {
   function connectWs() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     const q = `role=publisher&hall=${encodeURIComponent(hall)}&key=${encodeURIComponent(key)}`
-    ws = new WebSocket(`${proto}://${location.host}/ws?${q}`)
+    ws = new WebSocket(`${proto}://${location.host}${BASE}ws?${q}`)
 
     ws.onopen = () => { wsBackoff = 500; setWs('live', 'relay connected') }
     ws.onmessage = (ev) => {
@@ -200,7 +204,7 @@ if (window.SPEECH_SDK_FALLBACK) {
   // ---- Azure recognizer ----------------------------------------------------
 
   async function fetchToken() {
-    const res = await fetch('/api/token?key=' + encodeURIComponent(key))
+    const res = await fetch(BASE + 'api/token?key=' + encodeURIComponent(key))
     if (!res.ok) throw new Error('token endpoint: ' + res.status + ' ' + (await res.text()))
     return res.json()
   }
