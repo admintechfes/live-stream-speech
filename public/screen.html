@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Captions</title>
+<style>
+  :root { --size: 52px; --lines: 3; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: #000; overflow: hidden; }
+  body {
+    font-family: "Noto Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+    color: #fff;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    cursor: none;
+  }
+  #captions {
+    padding: 4vh 5vw 6vh;
+    font-size: var(--size);
+    line-height: 1.28;
+    font-weight: 600;
+    letter-spacing: 0.005em;
+    text-wrap: pretty;
+  }
+  .line { margin-top: 0.35em; transition: opacity 140ms linear; }
+  .line:first-child { margin-top: 0; }
+  .partial { color: #b9c2cc; }
+  #captions.blanked { visibility: hidden; }
+
+  /* Setup aids — deliberately unobtrusive during the event. */
+  #label {
+    position: fixed; top: 2vh; left: 2vw;
+    font-size: 20px; font-weight: 600; letter-spacing: 0.12em;
+    text-transform: uppercase; color: #4a5560; display: none;
+  }
+  body.labelled #label { display: block; }
+  #dot {
+    position: fixed; bottom: 10px; right: 12px;
+    width: 9px; height: 9px; border-radius: 50%;
+    background: #1f8f4a; opacity: 0.5;
+  }
+  #dot.down { background: #d04a2a; opacity: 1; animation: pulse 1.1s infinite; }
+  @keyframes pulse { 50% { opacity: 0.25; } }
+
+  #fatal {
+    display: none; margin: auto; padding: 6vh 6vw; text-align: center;
+    border: 3px solid #d04a2a; border-radius: 14px; max-width: 80vw;
+  }
+  #fatal h1 { font-size: 68px; color: #ff6a45; letter-spacing: 0.04em; }
+  #fatal p { font-size: 26px; color: #98a2ad; margin-top: 20px; line-height: 1.5; }
+  body.fatal { justify-content: center; }
+  body.fatal #captions, body.fatal #dot { display: none; }
+  body.fatal #fatal { display: block; }
+</style>
+</head>
+<body>
+  <div id="label"></div>
+  <div id="captions" aria-live="polite"></div>
+  <div id="dot" class="down"></div>
+  <div id="fatal"><h1 id="fatalTitle">NOT CONFIGURED</h1><p id="fatalBody"></p></div>
+
+<script>
+(() => {
+  const params = new URLSearchParams(location.search)
+  const hall = (params.get('hall') || '').trim()
+  const size = params.get('size')
+  const lines = Number(params.get('lines') || 3)
+  const label = params.get('label') === '1'
+
+  const $captions = document.getElementById('captions')
+  const $dot = document.getElementById('dot')
+
+  let maxLines = Math.max(1, lines)
+  if (size) document.documentElement.style.setProperty('--size', /^\d+$/.test(size) ? size + 'px' : size)
+  if (label) { document.body.classList.add('labelled'); document.getElementById('label').textContent = hall || 'no hall' }
+
+  function fatal(title, body) {
+    document.body.classList.add('fatal')
+    document.getElementById('fatalTitle').textContent = title
+    document.getElementById('fatalBody').textContent = body
+  }
+
+  // A screen with no hall shows an obviously broken card rather than guessing.
+  // Silent mis-routing is the failure nobody notices until it is on a wall.
+  if (!hall) {
+    fatal('NOT CONFIGURED', 'This screen has no hall assigned. Open it as  /screen.html?hall=<hall-id>')
+    return
+  }
+
+  let finals = []
+  let partial = ''
+  let frozen = false
+  let blanked = false
+
+  function render() {
+    if (frozen) return
+    $captions.classList.toggle('blanked', blanked)
+    const visible = finals.slice(-Math.max(1, maxLines - (partial ? 1 : 0)))
+    const html = visible.map((t) => `<div class="line">${esc(t)}</div>`)
+    if (partial) html.push(`<div class="line partial">${esc(partial)}</div>`)
+    $captions.innerHTML = html.join('')
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
+  }
+
+  // Reconnect forever, and keep the last captions on screen while doing it.
+  // A 10-second blip should be invisible to the audience, not a black wall.
+  let ws = null
+  let backoff = 500
+
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    ws = new WebSocket(`${proto}://${location.host}/ws?role=screen&hall=${encodeURIComponent(hall)}`)
+
+    ws.onopen = () => { backoff = 500; $dot.classList.remove('down') }
+
+    ws.onmessage = (ev) => {
+      let m
+      try { m = JSON.parse(ev.data) } catch { return }
+      switch (m.type) {
+        case 'hello':
+          finals = m.finals || []
+          partial = m.partial || ''
+          blanked = Boolean(m.blanked)
+          frozen = Boolean(m.frozen)
+          render()
+          break
+        case 'final':
+          partial = ''
+          finals.push(m.text)
+          if (finals.length > 100) finals = finals.slice(-100)
+          render()
+          break
+        case 'partial':
+          partial = m.text
+          render()
+          break
+        case 'blank':
+          blanked = m.value
+          $captions.classList.toggle('blanked', blanked)
+          break
+        case 'freeze':
+          frozen = m.value
+          if (!frozen) render()
+          break
+        case 'clear':
+          finals = []; partial = ''; frozen = false; render()
+          break
+        case 'style':
+          if (m.size) document.documentElement.style.setProperty('--size', m.size + 'px')
+          if (m.lines) { maxLines = m.lines; render() }
+          break
+        case 'error':
+          fatal(m.code === 'unknown_hall' ? 'UNKNOWN HALL' : 'NOT CONFIGURED', m.message)
+          ws.onclose = null
+          break
+      }
+    }
+
+    ws.onclose = () => {
+      $dot.classList.add('down')
+      setTimeout(connect, backoff)
+      backoff = Math.min(backoff * 1.7, 8000)
+    }
+    ws.onerror = () => ws.close()
+  }
+
+  connect()
+
+  // Keep TVs from sleeping mid-session where the browser allows it.
+  if ('wakeLock' in navigator) {
+    const hold = () => navigator.wakeLock.request('screen').catch(() => {})
+    hold()
+    document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && hold())
+  }
+})()
+</script>
+</body>
+</html>

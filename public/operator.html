@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operator — Event Captions</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 22px; background: #12161b; color: #e7ecf2;
+    font: 15px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+  h1 { font-size: 19px; margin: 0; }
+  .sub { color: #8b97a5; font-size: 13px; }
+  #panic {
+    margin-left: auto; background: #8f2317; color: #fff; border: 1px solid #b4402f;
+    font: inherit; font-weight: 700; padding: 12px 24px; border-radius: 8px; cursor: pointer;
+    letter-spacing: 0.03em;
+  }
+  #panic.on { background: #d04a2a; }
+  .hall {
+    background: #1a2027; border: 1px solid #29323c; border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 14px;
+  }
+  .hall.blanked { border-color: #7a3520; background: #241a17; }
+  .hall.dead { border-color: #4a3a1a; }
+  .top { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .name { font-size: 17px; font-weight: 700; letter-spacing: 0.02em; min-width: 96px; }
+  .stat { font-size: 12px; color: #8b97a5; display: flex; align-items: center; gap: 6px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #55606c; }
+  .dot.live { background: #2fbf6a; }
+  .dot.warn { background: #e0a92b; }
+  .dot.err  { background: #d04a2a; }
+  .controls { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+  button.ctl {
+    font: inherit; font-size: 14px; font-weight: 600; padding: 9px 16px; border-radius: 7px;
+    background: #2a333d; color: #e7ecf2; border: 1px solid #3c4753; cursor: pointer;
+  }
+  button.ctl.blank { background: #7a2418; border-color: #a03826; }
+  button.ctl.blank.on { background: #d04a2a; border-color: #e8674a; }
+  button.ctl.on { background: #3a6ea5; border-color: #4a8bd0; }
+  .caption {
+    margin-top: 12px; padding: 11px 13px; background: #0e1216; border-radius: 7px;
+    font-size: 16px; min-height: 46px; color: #c7d0da;
+  }
+  .caption .pre { color: #e0a92b; }
+  .caption em { color: #6c7885; font-style: normal; }
+  .links { font-size: 12px; color: #6c7885; margin-top: 9px; }
+  .links a { color: #6c7885; }
+  #warn { padding: 12px 14px; border-radius: 8px; background: #3a1d16; border: 1px solid #7a3520; color: #ffb59c; margin-bottom: 16px; display: none; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Caption operator</h1>
+    <div class="sub" id="delayNote"></div>
+    <button id="panic">BLANK ALL HALLS</button>
+  </header>
+  <div id="warn"></div>
+  <div id="halls"></div>
+
+<script>
+(() => {
+  const key = new URLSearchParams(location.search).get('key') || ''
+  const $ = (id) => document.getElementById(id)
+  const state = new Map() // hallId -> { el, blanked, frozen, lastText, previewText }
+  let allBlanked = false
+  let ws = null
+  let backoff = 500
+
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    ws = new WebSocket(`${proto}://${location.host}/ws?role=operator&key=${encodeURIComponent(key)}`)
+    ws.onopen = () => { backoff = 500; $('warn').style.display = 'none' }
+    ws.onmessage = (ev) => handle(JSON.parse(ev.data))
+    ws.onclose = () => {
+      warn('Disconnected from relay — retrying. Controls are inactive until this clears.')
+      setTimeout(connect, backoff)
+      backoff = Math.min(backoff * 1.7, 8000)
+    }
+    ws.onerror = () => ws.close()
+  }
+
+  const warn = (m) => { $('warn').style.display = 'block'; $('warn').textContent = m }
+  const send = (obj) => ws && ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(obj))
+
+  function handle(m) {
+    switch (m.type) {
+      case 'hello':
+        if (m.captionDelayMs > 0) {
+          $('delayNote').textContent = `${m.captionDelayMs}ms review delay — amber text has not reached the screens yet`
+        }
+        m.halls.forEach(buildHall)
+        break
+      case 'health':
+        m.halls.forEach(applyHealth)
+        break
+      case 'error':
+        warn(m.message)
+        ws.onclose = null
+        break
+      case 'preview':
+      case 'final':
+      case 'partial': {
+        const s = state.get(m.hallId)
+        if (!s) return
+        if (m.type === 'preview') s.previewText = m.text
+        else { s.lastText = m.text; if (m.type === 'final') s.previewText = '' }
+        paintCaption(m.hallId)
+        break
+      }
+    }
+  }
+
+  function buildHall(hallId) {
+    const el = document.createElement('div')
+    el.className = 'hall'
+    el.innerHTML = `
+      <div class="top">
+        <div class="name">${hallId}</div>
+        <div class="stat"><span class="dot" data-pub></span><span data-pubtext>no capture</span></div>
+        <div class="stat"><span data-screens>0</span> screens</div>
+        <div class="stat"><span data-age>—</span></div>
+        <div class="controls">
+          <button class="ctl blank" data-act="blank">Blank</button>
+          <button class="ctl" data-act="freeze">Freeze</button>
+          <button class="ctl" data-act="clear">Clear</button>
+          <button class="ctl" data-act="smaller">A−</button>
+          <button class="ctl" data-act="bigger">A+</button>
+        </div>
+      </div>
+      <div class="caption" data-caption><em>waiting for captions…</em></div>
+      <div class="links">
+        <a href="/screen.html?hall=${hallId}&label=1" target="_blank">screen</a> ·
+        <a href="/capture.html?hall=${hallId}${key ? '&key=' + encodeURIComponent(key) : ''}" target="_blank">capture</a>
+      </div>`
+    $('halls').appendChild(el)
+
+    const s = { el, blanked: false, frozen: false, lastText: '', previewText: '', size: 52 }
+    state.set(hallId, s)
+
+    el.querySelectorAll('button[data-act]').forEach((btn) => {
+      btn.onclick = () => {
+        const act = btn.dataset.act
+        if (act === 'blank') send({ type: 'blank', hallId, value: !s.blanked })
+        else if (act === 'freeze') { s.frozen = !s.frozen; send({ type: 'freeze', hallId, value: s.frozen }); btn.classList.toggle('on', s.frozen) }
+        else if (act === 'clear') { s.lastText = ''; s.previewText = ''; paintCaption(hallId); send({ type: 'clear', hallId }) }
+        else if (act === 'bigger' || act === 'smaller') {
+          s.size = Math.max(24, Math.min(110, s.size + (act === 'bigger' ? 4 : -4)))
+          send({ type: 'style', hallId, size: s.size })
+        }
+      }
+    })
+  }
+
+  function applyHealth(h) {
+    const s = state.get(h.hallId)
+    if (!s) return
+    s.blanked = h.blanked
+    const el = s.el
+    el.classList.toggle('blanked', h.blanked)
+    el.classList.toggle('dead', !h.publisherLive)
+    el.querySelector('[data-pub]').className = 'dot ' + (h.publisherLive ? 'live' : 'err')
+    el.querySelector('[data-pubtext]').textContent = h.publisherLive ? 'capture live' : 'NO CAPTURE'
+    el.querySelector('[data-screens]').textContent = h.screens
+    el.querySelector('.blank').classList.toggle('on', h.blanked)
+    el.querySelector('.blank').textContent = h.blanked ? 'BLANKED' : 'Blank'
+
+    const ageEl = el.querySelector('[data-age]')
+    if (h.lastCaptionAgeMs === null) ageEl.textContent = 'no captions yet'
+    else {
+      const secs = Math.round(h.lastCaptionAgeMs / 1000)
+      ageEl.textContent = secs < 2 ? 'flowing' : `last caption ${secs}s ago`
+      ageEl.style.color = secs > 25 ? '#e0a92b' : '#8b97a5'
+    }
+  }
+
+  function paintCaption(hallId) {
+    const s = state.get(hallId)
+    const parts = []
+    if (s.lastText) parts.push(esc(s.lastText))
+    if (s.previewText) parts.push(`<span class="pre">${esc(s.previewText)}</span>`)
+    s.el.querySelector('[data-caption]').innerHTML = parts.join(' ') || '<em>waiting for captions…</em>'
+  }
+
+  const esc = (t) => String(t).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
+
+  $('panic').onclick = () => {
+    allBlanked = !allBlanked
+    send({ type: 'blank', hallId: '*', value: allBlanked })
+    $('panic').classList.toggle('on', allBlanked)
+    $('panic').textContent = allBlanked ? 'RESTORE ALL HALLS' : 'BLANK ALL HALLS'
+  }
+
+  // Spacebar is the fastest blank-everything control when something is said
+  // that must not stay on a wall.
+  document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && e.target === document.body) { e.preventDefault(); $('panic').click() }
+  })
+
+  connect()
+})()
+</script>
+</body>
+</html>

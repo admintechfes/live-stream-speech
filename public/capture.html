@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capture — Event Captions</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: #12161b; color: #e7ecf2;
+    font: 15px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  h1 { font-size: 19px; margin: 0 0 4px; letter-spacing: 0.01em; }
+  .sub { color: #8b97a5; font-size: 13px; margin-bottom: 20px; }
+  .card { background: #1a2027; border: 1px solid #29323c; border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+  label { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: #8b97a5; margin-bottom: 6px; }
+  select, input {
+    width: 100%; padding: 9px 11px; background: #0e1216; color: #e7ecf2;
+    border: 1px solid #333e4a; border-radius: 7px; font-size: 14px;
+  }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 220px; }
+  button {
+    font: inherit; font-weight: 600; padding: 12px 22px; border-radius: 8px;
+    border: 1px solid transparent; cursor: pointer;
+  }
+  #start { background: #1f8f4a; color: #fff; }
+  #stop { background: #2a333d; color: #e7ecf2; border-color: #3c4753; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  .status { display: flex; align-items: center; gap: 9px; font-weight: 600; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #55606c; }
+  .dot.live { background: #2fbf6a; box-shadow: 0 0 0 4px rgba(47,191,106,0.15); }
+  .dot.warn { background: #e0a92b; }
+  .dot.err  { background: #d04a2a; }
+  #meter { height: 12px; background: #0e1216; border-radius: 6px; overflow: hidden; border: 1px solid #333e4a; }
+  #meterFill { height: 100%; width: 0%; background: linear-gradient(90deg, #2fbf6a 0 62%, #e0a92b 62% 85%, #d04a2a 85%); transition: width 60ms linear; }
+  .hint { font-size: 12px; color: #8b97a5; margin-top: 6px; }
+  #monitor { min-height: 130px; font-size: 17px; line-height: 1.5; }
+  #monitor .fin { margin-bottom: 7px; }
+  #monitor .par { color: #8b97a5; }
+  #log { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #7d8895; max-height: 150px; overflow-y: auto; white-space: pre-wrap; }
+  .banner { padding: 12px 14px; border-radius: 8px; background: #3a1d16; border: 1px solid #7a3520; color: #ffb59c; margin-bottom: 16px; display: none; }
+</style>
+</head>
+<body>
+  <h1>Capture — <span id="hallName">?</span></h1>
+  <div class="sub">Feed this page from the AV mixer line-out via the USB audio interface. Never a room mic.</div>
+
+  <div class="banner" id="banner"></div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="device">Audio input</label>
+        <select id="device"></select>
+        <div class="hint">Pick the USB interface, not the built-in mic.</div>
+      </div>
+      <div>
+        <label>Input level — aim for peaks around 70&ndash;80%, never pinned</label>
+        <div id="meter"><div id="meterFill"></div></div>
+        <div class="hint" id="levelHint">&mdash;</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="align-items:center">
+      <div style="flex:0 0 auto"><button id="start">Start captions</button></div>
+      <div style="flex:0 0 auto"><button id="stop" disabled>Stop</button></div>
+      <div class="status"><span class="dot" id="recDot"></span><span id="recState">idle</span></div>
+      <div class="status"><span class="dot" id="wsDot"></span><span id="wsState">relay offline</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>Live monitor</label>
+    <div id="monitor"></div>
+  </div>
+
+  <div class="card">
+    <label>Log</label>
+    <div id="log"></div>
+  </div>
+
+<script src="/vendor/speech-sdk.js" onerror="this.dataset.failed=1"></script>
+<script>
+window.SPEECH_SDK_FALLBACK = !window.SpeechSDK
+</script>
+<script>
+if (window.SPEECH_SDK_FALLBACK) {
+  document.write('<script src="https://aka.ms/csspeech/jsbrowserpackageraw"><\/script>')
+}
+</script>
+<script>
+(() => {
+  const params = new URLSearchParams(location.search)
+  const hall = (params.get('hall') || '').trim()
+  const key = params.get('key') || ''
+
+  const $ = (id) => document.getElementById(id)
+  const banner = (msg) => { $('banner').style.display = 'block'; $('banner').textContent = msg }
+  const log = (msg) => {
+    const t = new Date().toTimeString().slice(0, 8)
+    $('log').textContent = `${t}  ${msg}\n` + $('log').textContent.split('\n').slice(0, 120).join('\n')
+  }
+
+  $('hallName').textContent = hall || 'NO HALL SET'
+  if (!hall) {
+    banner('No hall specified. Open this page as /capture.html?hall=<hall-id>.')
+    $('start').disabled = true
+    return
+  }
+
+  let cfg = null          // { region, sourceLanguages, targetLanguage, phraseList }
+  let ws = null
+  let wsBackoff = 500
+  let recognizer = null
+  let running = false
+  let lastEventTs = 0
+  let tokenTimer = null
+  let watchdogTimer = null
+  let finals = []
+
+  // ---- relay ---------------------------------------------------------------
+
+  function connectWs() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    const q = `role=publisher&hall=${encodeURIComponent(hall)}&key=${encodeURIComponent(key)}`
+    ws = new WebSocket(`${proto}://${location.host}/ws?${q}`)
+
+    ws.onopen = () => { wsBackoff = 500; setWs('live', 'relay connected') }
+    ws.onmessage = (ev) => {
+      const m = JSON.parse(ev.data)
+      if (m.type === 'error') {
+        setWs('err', m.code)
+        banner(m.message + (m.code === 'publisher_taken' ? ' Close the other capture tab, then reload.' : ''))
+        ws.onclose = null
+      }
+    }
+    ws.onclose = () => {
+      setWs('err', 'relay offline — retrying')
+      setTimeout(connectWs, wsBackoff)
+      wsBackoff = Math.min(wsBackoff * 1.7, 8000)
+    }
+    ws.onerror = () => ws.close()
+  }
+
+  function publish(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj))
+  }
+
+  const setWs = (cls, text) => { $('wsDot').className = 'dot ' + cls; $('wsState').textContent = text }
+  const setRec = (cls, text) => { $('recDot').className = 'dot ' + cls; $('recState').textContent = text }
+
+  // ---- audio device list + level meter ------------------------------------
+
+  async function initAudio() {
+    try {
+      await navigator.mediaDevices.getUserMedia({ audio: true })
+    } catch (err) {
+      banner('Microphone permission denied. This page must be served over HTTPS and allowed to use audio.')
+      throw err
+    }
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput')
+    $('device').innerHTML = devices
+      .map((d) => `<option value="${d.deviceId}">${d.label || 'Input ' + d.deviceId.slice(0, 6)}</option>`)
+      .join('')
+    $('device').onchange = () => startMeter($('device').value)
+    if (devices.length) startMeter(devices[0].deviceId)
+  }
+
+  let meterCtx = null
+  async function startMeter(deviceId) {
+    if (meterCtx) { meterCtx.close(); meterCtx = null }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: { exact: deviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    })
+    meterCtx = new AudioContext()
+    const src = meterCtx.createMediaStreamSource(stream)
+    const analyser = meterCtx.createAnalyser()
+    analyser.fftSize = 1024
+    src.connect(analyser)
+    const buf = new Float32Array(analyser.fftSize)
+    let peak = 0
+    ;(function tick() {
+      if (!meterCtx) return
+      analyser.getFloatTimeDomainData(buf)
+      let max = 0
+      for (const v of buf) max = Math.max(max, Math.abs(v))
+      peak = Math.max(max, peak * 0.92)
+      const pct = Math.min(100, peak * 100)
+      $('meterFill').style.width = pct.toFixed(0) + '%'
+      const db = peak > 0 ? (20 * Math.log10(peak)).toFixed(1) : '-inf'
+      $('levelHint').textContent =
+        `peak ${db} dBFS — ` + (peak > 0.95 ? 'CLIPPING, ask AV to drop the send' : peak < 0.05 ? 'too quiet / no feed' : 'good')
+      requestAnimationFrame(tick)
+    })()
+  }
+
+  // ---- Azure recognizer ----------------------------------------------------
+
+  async function fetchToken() {
+    const res = await fetch('/api/token?key=' + encodeURIComponent(key))
+    if (!res.ok) throw new Error('token endpoint: ' + res.status + ' ' + (await res.text()))
+    return res.json()
+  }
+
+  async function startRecognizer() {
+    cfg = await fetchToken()
+    const S = window.SpeechSDK
+    if (!S) throw new Error('Speech SDK failed to load (no local bundle and no internet).')
+
+    const speechConfig = S.SpeechTranslationConfig.fromAuthorizationToken(cfg.token, cfg.region)
+    speechConfig.addTargetLanguage(cfg.targetLanguage)
+    // Continuous LID: speakers switch between Tamil, Hindi and English mid-talk
+    // and no operator should have to notice.
+    speechConfig.setProperty(S.PropertyId.SpeechServiceConnection_LanguageIdMode, 'Continuous')
+    speechConfig.setProfanity(S.ProfanityOption.Masked)
+
+    const autoDetect = S.AutoDetectSourceLanguageConfig.fromLanguages(cfg.sourceLanguages)
+    const audioConfig = S.AudioConfig.fromMicrophoneInput($('device').value)
+    recognizer = S.TranslationRecognizer.FromConfig(speechConfig, autoDetect, audioConfig)
+
+    if (cfg.phraseList && cfg.phraseList.length) {
+      const grammar = S.PhraseListGrammar.fromRecognizer(recognizer)
+      cfg.phraseList.forEach((p) => grammar.addPhrase(p))
+      log(`phrase list: ${cfg.phraseList.length} entries`)
+    }
+
+    const target = cfg.targetLanguage
+
+    recognizer.recognizing = (_s, e) => {
+      const text = e.result.translations && e.result.translations.get(target)
+      lastEventTs = Date.now()
+      if (!text) return
+      publish({ type: 'partial', text, lang: detected(e) })
+      paint(text, true)
+    }
+
+    recognizer.recognized = (_s, e) => {
+      lastEventTs = Date.now()
+      const text = e.result.translations && e.result.translations.get(target)
+      if (!text || !text.trim()) return
+      publish({ type: 'final', text, lang: detected(e) })
+      finals.push(text)
+      if (finals.length > 8) finals.shift()
+      paint('', false)
+    }
+
+    recognizer.canceled = (_s, e) => {
+      log(`canceled: ${e.errorDetails || e.reason}`)
+      setRec('err', 'canceled — restarting')
+      if (running) restart('canceled')
+    }
+
+    recognizer.sessionStopped = () => {
+      log('session stopped')
+      if (running) restart('sessionStopped')
+    }
+
+    await new Promise((resolve, reject) =>
+      recognizer.startContinuousRecognitionAsync(resolve, reject)
+    )
+
+    lastEventTs = Date.now()
+    setRec('live', 'recognizing')
+    log('recognizer started')
+
+    // Tokens last ~10 minutes; refresh well inside that.
+    clearInterval(tokenTimer)
+    tokenTimer = setInterval(async () => {
+      try {
+        const fresh = await fetchToken()
+        recognizer.authorizationToken = fresh.token
+        log('auth token refreshed')
+      } catch (err) {
+        log('token refresh failed: ' + err.message)
+      }
+    }, 7 * 60 * 1000)
+  }
+
+  function detected(e) {
+    try {
+      return window.SpeechSDK.AutoDetectSourceLanguageResult.fromResult(e.result).language || null
+    } catch { return null }
+  }
+
+  function paint(partial, isPartial) {
+    const html = finals.map((t) => `<div class="fin">${escapeHtml(t)}</div>`)
+    if (isPartial && partial) html.push(`<div class="par">${escapeHtml(partial)}</div>`)
+    $('monitor').innerHTML = html.join('')
+  }
+
+  const escapeHtml = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
+
+  async function stopRecognizer() {
+    clearInterval(tokenTimer)
+    if (!recognizer) return
+    const r = recognizer
+    recognizer = null
+    await new Promise((resolve) => r.stopContinuousRecognitionAsync(resolve, resolve))
+    try { r.close() } catch {}
+  }
+
+  let restarting = false
+  async function restart(reason) {
+    if (restarting) return
+    restarting = true
+    log('restarting recognizer: ' + reason)
+    setRec('warn', 'restarting')
+    publish({ type: 'status', state: 'restarting', reason })
+    try {
+      await stopRecognizer()
+      await new Promise((r) => setTimeout(r, 800))
+      if (running) await startRecognizer()
+    } catch (err) {
+      log('restart failed: ' + err.message)
+      setRec('err', 'restart failed')
+      if (running) setTimeout(() => { restarting = false; restart('retry') }, 3000)
+      return
+    }
+    restarting = false
+  }
+
+  // Watchdog: the recognizer occasionally goes quiet without firing an event.
+  // If nothing has come back for 20s while we are supposed to be live, cycle it.
+  watchdogTimer = setInterval(() => {
+    if (!running || restarting || !lastEventTs) return
+    if (Date.now() - lastEventTs > 20000) restart('watchdog: 20s silent')
+  }, 5000)
+
+  // ---- controls ------------------------------------------------------------
+
+  $('start').onclick = async () => {
+    $('start').disabled = true
+    running = true
+    try {
+      await startRecognizer()
+      $('stop').disabled = false
+    } catch (err) {
+      running = false
+      $('start').disabled = false
+      setRec('err', 'failed')
+      banner(err.message)
+      log('start failed: ' + err.message)
+    }
+  }
+
+  $('stop').onclick = async () => {
+    running = false
+    $('stop').disabled = true
+    await stopRecognizer()
+    setRec('', 'stopped')
+    $('start').disabled = false
+    log('stopped by operator')
+  }
+
+  window.addEventListener('beforeunload', (e) => {
+    if (running) { e.preventDefault(); e.returnValue = '' }
+  })
+
+  connectWs()
+  initAudio().catch(() => {})
+})()
+</script>
+</body>
+</html>
