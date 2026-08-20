@@ -111,6 +111,7 @@ deployed VM before doors open.
 | `size` | Caption font size in px (default 52). Tune from the back row, not the laptop |
 | `lines` | Visible lines (default 3) |
 | `label=1` | Shows the hall name in the corner — use during setup to confirm each wall is on the right channel |
+| `notice` | The standing "AI-generated translation · may contain errors" disclaimer, top-right. **On by default.** `notice=0` hides it; `notice=<text>` replaces the wording (e.g. a Tamil translation of it) |
 
 ## Operator console
 

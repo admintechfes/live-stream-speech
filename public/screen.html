@@ -36,6 +36,14 @@
     text-transform: uppercase; color: #4a5560; display: none;
   }
   body.labelled #label { display: block; }
+  /* Standing disclaimer. Deliberately low-contrast and out of the caption
+     block: legible to anyone who looks for it, invisible to anyone reading. */
+  #notice {
+    position: fixed; top: 2.2vh; right: 2.5vw;
+    font-size: clamp(13px, 1.5vh, 22px);
+    font-weight: 500; letter-spacing: 0.04em;
+    color: #6b7683; text-align: right; max-width: 40vw;
+  }
   #dot {
     position: fixed; bottom: 10px; right: 12px;
     width: 9px; height: 9px; border-radius: 50%;
@@ -51,12 +59,13 @@
   #fatal h1 { font-size: 68px; color: #ff6a45; letter-spacing: 0.04em; }
   #fatal p { font-size: 26px; color: #98a2ad; margin-top: 20px; line-height: 1.5; }
   body.fatal { justify-content: center; }
-  body.fatal #captions, body.fatal #dot { display: none; }
+  body.fatal #captions, body.fatal #dot, body.fatal #notice { display: none; }
   body.fatal #fatal { display: block; }
 </style>
 </head>
 <body>
   <div id="label"></div>
+  <div id="notice">AI-generated translation &middot; may contain errors</div>
   <div id="captions" aria-live="polite"></div>
   <div id="dot" class="down"></div>
   <div id="fatal"><h1 id="fatalTitle">NOT CONFIGURED</h1><p id="fatalBody"></p></div>
@@ -68,6 +77,10 @@
   const size = params.get('size')
   const lines = Number(params.get('lines') || 3)
   const label = params.get('label') === '1'
+  // The disclaimer is on by default — it is the kind of thing that gets
+  // switched off "just for this screen" and then never explained to anyone.
+  // ?notice=0 removes it; ?notice=<text> replaces the wording.
+  const notice = params.get('notice')
 
   const $captions = document.getElementById('captions')
   const $dot = document.getElementById('dot')
@@ -75,6 +88,10 @@
   let maxLines = Math.max(1, lines)
   if (size) document.documentElement.style.setProperty('--size', /^\d+$/.test(size) ? size + 'px' : size)
   if (label) { document.body.classList.add('labelled'); document.getElementById('label').textContent = hall || 'no hall' }
+
+  const $notice = document.getElementById('notice')
+  if (notice === '0' || notice === 'off') $notice.style.display = 'none'
+  else if (notice) $notice.textContent = notice
 
   function fatal(title, body) {
     document.body.classList.add('fatal')
