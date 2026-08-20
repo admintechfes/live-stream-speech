@@ -144,22 +144,85 @@ the last HDMI metre, is the real single point of failure.
 
 ## Deploy
 
+Point the domain's **A record at the server first** — Caddy proves control of the domain over
+ports 80/443, so it cannot get a certificate until DNS resolves. Open **80 and 443** (80 is needed
+for the ACME challenge and the HTTPS redirect, not for traffic).
+
 ```bash
-# on the VM
+# Node 22 + pm2
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs && sudo npm i -g pm2
+
+# app
+cd ~/event-captions
 npm ci --omit=dev
-npm i -g pm2
-pm2 start server.js --name captions && pm2 save && pm2 startup
+cp .env.example .env && nano .env      # keys, HALLS, PORT=8080
+openssl rand -hex 16                   # -> CONTROL_KEY
+
+# raise the fd limit BEFORE pm2 starts: ~500 viewers is ~500 sockets in this
+# process, and Ubuntu's default of 1024 is close enough to hurt.
+sudo mkdir -p /etc/systemd/system/pm2-$USER.service.d
+printf '[Service]\nLimitNOFILE=65535\n' | sudo tee /etc/systemd/system/pm2-$USER.service.d/limits.conf
+
+pm2 start server.js --name captions
+pm2 save && pm2 startup                # run the command it prints
+sudo systemctl daemon-reload && pm2 restart captions
+cat /proc/$(pgrep -f 'node server.js')/limits | grep 'open files'   # expect 65535
 ```
 
-Caddy handles TLS in two lines:
+**Fork mode, one instance — never `pm2 -i`.** Hall state (subscribers, replay buffer, blank flag)
+lives in this process's memory. A second worker gets its own empty copy, so viewers would be split
+across two relays and half the room would sit on a black screen while the other half got captions.
+Scaling out needs Redis pub/sub between processes; it is not a flag.
+
+### Caddy
+
+```bash
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
+  | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update && sudo apt install -y caddy
+```
+
+`/etc/caddy/Caddyfile` in full:
 
 ```
 captions.example.org {
-    reverse_proxy localhost:8080
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080
 }
 ```
 
-Open 443 only. Websockets pass through Caddy without extra config.
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+sudo journalctl -u caddy -f          # watch the certificate being issued
+```
+
+That is the whole config. `reverse_proxy` passes WebSocket upgrades through untouched and, unlike
+nginx, applies **no idle read timeout** — so a quiet hall between speakers does not get its socket
+cut at 60 seconds. Certificates are obtained and renewed automatically; see below.
+
+### Verifying it holds 500 viewers
+
+```bash
+# on the server
+npm test
+
+# from a DIFFERENT machine — localhost hides every cost that matters
+ulimit -n 65535
+node tests/load-screens.js wss://captions.example.org 500 hall-4 "$CONTROL_KEY"
+```
+
+Pick a hall that is **not live** — the test takes that hall's publisher slot. Watch `pm2 monit` and
+the operator console while it runs: the screen count for that hall should read 500. Pass looks like
+zero failed connects, under 1% missing deliveries, and fan-out p95 well under 500ms.
+
+Fan-out is text only — roughly 25 KB/s total at 500 viewers — so CPU and bandwidth are not the
+limit here. The things that actually break at this size are the file-descriptor ceiling above, and
+reconnect storms when the relay restarts (viewers back off with jitter for exactly this reason).
 
 ## Pre-event checklist
 

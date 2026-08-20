@@ -167,7 +167,10 @@
 
     ws.onclose = () => {
       $dot.classList.add('down')
-      setTimeout(connect, backoff)
+      // Jitter matters at scale: without it, a relay restart brings every
+      // viewer back in lockstep and the reconnect burst is what kills the
+      // recovery, not the restart. Spread each client over its own window.
+      setTimeout(connect, backoff * (0.5 + Math.random()))
       backoff = Math.min(backoff * 1.7, 8000)
     }
     ws.onerror = () => ws.close()
