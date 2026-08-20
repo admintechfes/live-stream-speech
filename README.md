@@ -33,21 +33,53 @@ npm start
 
 Screens need no key. Capture and operator do, once `CONTROL_KEY` is set.
 
+## Speech engine
+
+`SPEECH_PROVIDER=azure` or `soniox`. The relay, the screens and the operator console are
+engine-agnostic — they only ever see text — so switching is a config change, not a code change.
+
+| | Azure | Soniox |
+|---|---|---|
+| Credential | `AZURE_SPEECH_KEY` + `AZURE_SPEECH_REGION` | `SONIOX_API_KEY`, model via `SONIOX_MODEL` |
+| In the browser | Speech SDK, `TranslationRecognizer` | `@soniox/speech-to-text-web`, loaded only when used |
+| What the server hands out | 10-minute auth token, refreshed every 7 min | single-session temporary key, minted per start |
+
+Both mint a **short-lived credential server-side**; neither real key ever reaches a browser.
+`SOURCE_LANGS` and `PHRASE_LIST` are written once in Azure's shape and translated for Soniox
+(`ta-IN,hi-IN,en-IN` → hints `ta,hi,en`; phrase list → context terms).
+
+**Per-hall override:** `?provider=soniox` on a capture URL runs that one hall on the other engine.
+This is how the A/B is run, and it is also the manual recovery path — if a hall's engine is
+misbehaving, the minder reloads its capture page with the other provider. There is deliberately **no
+automatic failover**: a code path that only fires under stress is the one you cannot rehearse.
+
+The operator console shows a per-hall engine badge, so the lead can see which hall is on what
+without asking.
+
+If the selected provider's credentials are missing, or `SPEECH_PROVIDER` is a name it does not
+recognise, **the server exits at boot** rather than failing when a minder first presses Start.
+
 **HTTPS is mandatory** in production — browsers refuse microphone access on plain HTTP (localhost
 excepted), so the capture page will not work without TLS.
 
 ## Day-1 spike
 
-Decide Azure vs Soniox before building anything else:
+Run the same clip through both engines and compare:
 
 ```bash
 ffmpeg -i raw-tamil.m4a -ar 16000 -ac 1 -c:a pcm_s16le sample-tamil.wav
-node spike/azure-file-test.js sample-tamil.wav
+node spike/azure-file-test.js  sample-tamil.wav
+node spike/soniox-file-test.js sample-tamil.wav
 ```
 
-Prints each translated line with its detected language and settle time. Judge the **text** by eye —
-that is what the tool is for. File input is processed faster than realtime, so its timings
-understate live lag; real latency can only be measured from the mixer, in the hall.
+Both print each translated line with its detected language and settle time, in the same format.
+Judge the **text** by eye — that is what these are for. Azure's file input is processed faster than
+realtime so its timings understate live lag; the Soniox spike paces audio at realtime and is closer
+to honest. Neither replaces measuring from the mixer, in the hall.
+
+The decision-quality test is the live A/B: one hall on `?provider=azure`, another on
+`?provider=soniox`, same audio into both, watched side by side on the operator console. Tamil
+code-switching mid-sentence is where the two will actually differ.
 
 Verified working against a synthesized Tamil→Hindi→English clip: both non-English segments
 translated correctly and continuous LID switched languages unprompted. Two things that showed up
@@ -67,8 +99,9 @@ npm test
 
 Covers the failures that would actually embarrass you: **cross-talk between halls**, unknown/missing
 hall refusal, the one-publisher-per-hall lock, replay on screen reload, per-hall blank, health
-accuracy after a publisher drops, review-delay behaviour, and control-key auth. Run it after any
-change and once on the deployed VM before doors open.
+accuracy after a publisher drops, review-delay behaviour, control-key auth, provider mapping, and
+the boot guards that refuse to start a misconfigured engine. Run it after any change and once on the
+deployed VM before doors open.
 
 ## Screen URL parameters
 
@@ -130,7 +163,7 @@ Open 443 only. Websockets pass through Caddy without extra config.
 
 ## Pre-event checklist
 
-- [ ] Day-1 spike run on real Tamil audio; engine decision made
+- [ ] Both spikes run on real Tamil audio; live A/B done; `SPEECH_PROVIDER` set to the winner
 - [ ] `PHRASE_LIST` seeded with speaker names, org names, event terms
 - [ ] `CONTROL_KEY` set; capture/operator URLs distributed only to staff
 - [ ] Azure concurrency limit confirmed for 4 simultaneous streams
@@ -153,6 +186,7 @@ Lead    : ______________  (radio channel ___)
 
 Captions frozen or wrong        -> Blank, then reload the capture page and press Start
 Captions stopped                -> check the capture page dot; press Stop then Start
+Engine misbehaving all talk     -> reload capture with &provider=______ and press Start
 Screen black                    -> reload the screen URL; check it says hall-2 top-left
 Everything down                 -> switch the capture laptop to the backup hotspot
 Something said that must not    -> Blank. Ask afterwards.

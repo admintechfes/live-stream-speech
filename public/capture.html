@@ -39,11 +39,16 @@
   #monitor .fin { margin-bottom: 7px; }
   #monitor .par { color: #8b97a5; }
   #log { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #7d8895; max-height: 150px; overflow-y: auto; white-space: pre-wrap; }
+  .badge {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+    padding: 3px 9px; border-radius: 999px; background: #223042; color: #7fb3e8;
+    border: 1px solid #31465e; vertical-align: middle;
+  }
   .banner { padding: 12px 14px; border-radius: 8px; background: #3a1d16; border: 1px solid #7a3520; color: #ffb59c; margin-bottom: 16px; display: none; }
 </style>
 </head>
 <body>
-  <h1>Capture — <span id="hallName">?</span></h1>
+  <h1>Capture — <span id="hallName">?</span> <span id="providerBadge" class="badge"></span></h1>
   <div class="sub">Feed this page from the AV mixer line-out via the USB audio interface. Never a room mic.</div>
 
   <div class="banner" id="banner"></div>
@@ -87,7 +92,10 @@
 window.SPEECH_SDK_FALLBACK = !window.SpeechSDK
 </script>
 <script>
-if (window.SPEECH_SDK_FALLBACK) {
+// Only reach for the CDN if the local bundle is missing AND this page is
+// actually going to use Azure — a Soniox hall should not pull ~700KB over
+// venue wifi for an engine it will never start.
+if (window.SPEECH_SDK_FALLBACK && (new URLSearchParams(location.search).get('provider') || 'azure') === 'azure') {
   document.write('<script src="https://aka.ms/csspeech/jsbrowserpackageraw"><\/script>')
 }
 </script>
@@ -96,6 +104,9 @@ if (window.SPEECH_SDK_FALLBACK) {
   const params = new URLSearchParams(location.search)
   const hall = (params.get('hall') || '').trim()
   const key = params.get('key') || ''
+  // Per-hall engine override, so one hall can be flipped to the other provider
+  // mid-event (or during an A/B) without touching .env on the server.
+  const providerOverride = (params.get('provider') || '').trim()
 
   const $ = (id) => document.getElementById(id)
   const banner = (msg) => { $('banner').style.display = 'block'; $('banner').textContent = msg }
@@ -115,10 +126,10 @@ if (window.SPEECH_SDK_FALLBACK) {
   // prefix like /live-stream/ without any nginx-side path rewriting.
   const BASE = location.pathname.replace(/[^/]*$/, '')
 
-  let cfg = null          // { region, sourceLanguages, targetLanguage, phraseList }
+  let cfg = null          // whatever /api/token returned for the active provider
   let ws = null
   let wsBackoff = 500
-  let recognizer = null
+  let driver = null       // { stop(), refreshCredential? } — Azure or Soniox
   let running = false
   let lastEventTs = 0
   let tokenTimer = null
@@ -201,16 +212,74 @@ if (window.SPEECH_SDK_FALLBACK) {
     })()
   }
 
-  // ---- Azure recognizer ----------------------------------------------------
+  // ---- recognizer: one interface, two engines ------------------------------
+  //
+  // Everything above and below this section is engine-agnostic. A driver takes
+  // the credential payload and a device, and calls back with plain text lines.
+  // Nothing else in this file — relay, meter, watchdog, restart — branches on
+  // which provider is running.
 
   async function fetchToken() {
-    const res = await fetch(BASE + 'api/token?key=' + encodeURIComponent(key))
+    const q = new URLSearchParams({ key, hall })
+    if (providerOverride) q.set('provider', providerOverride)
+    const res = await fetch(BASE + 'api/token?' + q)
     if (!res.ok) throw new Error('token endpoint: ' + res.status + ' ' + (await res.text()))
     return res.json()
   }
 
   async function startRecognizer() {
     cfg = await fetchToken()
+    $('providerBadge').textContent = cfg.provider
+
+    const handlers = {
+      onEvent: () => { lastEventTs = Date.now() },
+      onPartial: (text, lang) => {
+        if (!text) return
+        publish({ type: 'partial', text, lang })
+        paint(text, true)
+      },
+      onFinal: (text, lang) => {
+        if (!text || !text.trim()) return
+        publish({ type: 'final', text, lang })
+        finals.push(text)
+        if (finals.length > 8) finals.shift()
+        paint('', false)
+      },
+      onLog: log,
+      onRetry: (reason) => {
+        setRec('err', reason)
+        if (running) restart(reason)
+      },
+    }
+
+    const make = cfg.provider === 'soniox' ? sonioxDriver : azureDriver
+    driver = await make(cfg, $('device').value, handlers)
+
+    lastEventTs = Date.now()
+    setRec('live', 'recognizing')
+    log(`recognizer started (${cfg.provider})`)
+    // Tells the operator console which engine this hall is actually on, which
+    // during an A/B is the only trustworthy source.
+    publish({ type: 'status', state: 'started', provider: cfg.provider })
+
+    // Azure auth tokens last ~10 minutes; refresh well inside that. Soniox
+    // keys are only used at connect time, so its driver has nothing to refresh.
+    clearInterval(tokenTimer)
+    if (driver.refreshCredential) {
+      tokenTimer = setInterval(async () => {
+        try {
+          await driver.refreshCredential(await fetchToken())
+          log('auth token refreshed')
+        } catch (err) {
+          log('token refresh failed: ' + err.message)
+        }
+      }, 7 * 60 * 1000)
+    }
+  }
+
+  // ---- Azure driver --------------------------------------------------------
+
+  async function azureDriver(cfg, deviceId, h) {
     const S = window.SpeechSDK
     if (!S) throw new Error('Speech SDK failed to load (no local bundle and no internet).')
 
@@ -222,71 +291,156 @@ if (window.SPEECH_SDK_FALLBACK) {
     speechConfig.setProfanity(S.ProfanityOption.Masked)
 
     const autoDetect = S.AutoDetectSourceLanguageConfig.fromLanguages(cfg.sourceLanguages)
-    const audioConfig = S.AudioConfig.fromMicrophoneInput($('device').value)
-    recognizer = S.TranslationRecognizer.FromConfig(speechConfig, autoDetect, audioConfig)
+    const audioConfig = S.AudioConfig.fromMicrophoneInput(deviceId)
+    const recognizer = S.TranslationRecognizer.FromConfig(speechConfig, autoDetect, audioConfig)
 
     if (cfg.phraseList && cfg.phraseList.length) {
       const grammar = S.PhraseListGrammar.fromRecognizer(recognizer)
       cfg.phraseList.forEach((p) => grammar.addPhrase(p))
-      log(`phrase list: ${cfg.phraseList.length} entries`)
+      h.onLog(`phrase list: ${cfg.phraseList.length} entries`)
     }
 
     const target = cfg.targetLanguage
+    const detected = (e) => {
+      try {
+        return S.AutoDetectSourceLanguageResult.fromResult(e.result).language || null
+      } catch { return null }
+    }
 
     recognizer.recognizing = (_s, e) => {
+      h.onEvent()
       const text = e.result.translations && e.result.translations.get(target)
-      lastEventTs = Date.now()
-      if (!text) return
-      publish({ type: 'partial', text, lang: detected(e) })
-      paint(text, true)
+      if (text) h.onPartial(text, detected(e))
     }
 
     recognizer.recognized = (_s, e) => {
-      lastEventTs = Date.now()
+      h.onEvent()
       const text = e.result.translations && e.result.translations.get(target)
-      if (!text || !text.trim()) return
-      publish({ type: 'final', text, lang: detected(e) })
-      finals.push(text)
-      if (finals.length > 8) finals.shift()
-      paint('', false)
+      if (text) h.onFinal(text, detected(e))
     }
 
     recognizer.canceled = (_s, e) => {
-      log(`canceled: ${e.errorDetails || e.reason}`)
-      setRec('err', 'canceled — restarting')
-      if (running) restart('canceled')
+      h.onLog(`canceled: ${e.errorDetails || e.reason}`)
+      h.onRetry('canceled — restarting')
     }
 
     recognizer.sessionStopped = () => {
-      log('session stopped')
-      if (running) restart('sessionStopped')
+      h.onLog('session stopped')
+      h.onRetry('sessionStopped')
     }
 
-    await new Promise((resolve, reject) =>
-      recognizer.startContinuousRecognitionAsync(resolve, reject)
-    )
+    await new Promise((resolve, reject) => recognizer.startContinuousRecognitionAsync(resolve, reject))
 
-    lastEventTs = Date.now()
-    setRec('live', 'recognizing')
-    log('recognizer started')
-
-    // Tokens last ~10 minutes; refresh well inside that.
-    clearInterval(tokenTimer)
-    tokenTimer = setInterval(async () => {
-      try {
-        const fresh = await fetchToken()
+    return {
+      async refreshCredential(fresh) {
         recognizer.authorizationToken = fresh.token
-        log('auth token refreshed')
-      } catch (err) {
-        log('token refresh failed: ' + err.message)
-      }
-    }, 7 * 60 * 1000)
+      },
+      async stop() {
+        // Detach first: a deliberate stop must not look like a failure and
+        // trigger the restart loop.
+        recognizer.canceled = null
+        recognizer.sessionStopped = null
+        await new Promise((resolve) => recognizer.stopContinuousRecognitionAsync(resolve, resolve))
+        try { recognizer.close() } catch {}
+      },
+    }
   }
 
-  function detected(e) {
+  // ---- Soniox driver -------------------------------------------------------
+
+  async function loadSonioxSdk() {
     try {
-      return window.SpeechSDK.AutoDetectSourceLanguageResult.fromResult(e.result).language || null
-    } catch { return null }
+      return await import(BASE + 'vendor/soniox-sdk.js')
+    } catch (err) {
+      log('local Soniox SDK unavailable — falling back to CDN')
+      return await import('https://unpkg.com/@soniox/speech-to-text-web?module')
+    }
+  }
+
+  async function sonioxDriver(cfg, deviceId, h) {
+    const { SonioxClient } = await loadSonioxSdk()
+
+    // Soniox streams tokens, not lines: finals arrive once and accumulate,
+    // non-finals are replaced on every message. We rebuild the line model the
+    // relay already speaks — which is why endpoint detection is mandatory
+    // below, not optional. Without an endpoint no final is ever emitted, and
+    // the replay buffer, review delay and blank-drops-in-flight all sit idle.
+    const FLUSH_CHARS = 200
+    let finalBuffer = ''
+    let lastLang = null
+    let stopped = false
+
+    const flush = () => {
+      const text = finalBuffer.trim()
+      finalBuffer = ''
+      if (text) h.onFinal(text, lastLang)
+    }
+
+    const client = new SonioxClient({
+      apiKey: cfg.apiKey,
+      // Halls have long silences between speakers; without this the socket
+      // times out and every gap costs a reconnect.
+      keepAlive: true,
+      onError: (status, message) => {
+        if (stopped) return
+        h.onLog(`soniox error: ${status}${message ? ' — ' + message : ''}`)
+        h.onRetry(`soniox ${status}`)
+      },
+      onFinished: () => {
+        if (stopped) return
+        flush()
+        h.onLog('soniox session finished')
+        h.onRetry('session finished')
+      },
+      onPartialResult: (result) => {
+        h.onEvent()
+        let nonFinal = ''
+        let endpoint = false
+
+        for (const t of result.tokens || []) {
+          // Control tokens carry no text and must never reach a wall.
+          if (t.text === '<end>') { endpoint = true; continue }
+          if (t.text === '<fin>') continue
+          // Screens are English-only — the untranslated original is noise.
+          if (t.translation_status && t.translation_status !== 'translation') continue
+          if (t.source_language || t.language) lastLang = t.source_language || t.language
+          if (t.is_final) finalBuffer += t.text
+          else nonFinal += t.text
+        }
+
+        // Force-flush an unbroken monologue so one caption line cannot grow
+        // without limit when the speaker never pauses.
+        if (endpoint || finalBuffer.length > FLUSH_CHARS) flush()
+
+        const pending = (finalBuffer + nonFinal).trim()
+        if (pending) h.onPartial(pending, lastLang)
+      },
+    })
+
+    await client.start({
+      model: cfg.model,
+      languageHints: cfg.languageHints,
+      enableLanguageIdentification: true,
+      enableEndpointDetection: true,
+      translation: { type: 'one_way', target_language: cfg.targetLanguage },
+      ...(cfg.context ? { context: cfg.context } : {}),
+      // Match the level meter's constraints so what AV sees is what we send.
+      audioConstraints: {
+        deviceId: { exact: deviceId },
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+    })
+
+    if (cfg.context && cfg.context.terms) h.onLog(`context terms: ${cfg.context.terms.length}`)
+
+    return {
+      async stop() {
+        stopped = true
+        client.cancel()
+      },
+    }
   }
 
   function paint(partial, isPartial) {
@@ -299,11 +453,10 @@ if (window.SPEECH_SDK_FALLBACK) {
 
   async function stopRecognizer() {
     clearInterval(tokenTimer)
-    if (!recognizer) return
-    const r = recognizer
-    recognizer = null
-    await new Promise((resolve) => r.stopContinuousRecognitionAsync(resolve, resolve))
-    try { r.close() } catch {}
+    if (!driver) return
+    const d = driver
+    driver = null
+    try { await d.stop() } catch (err) { log('stop failed: ' + err.message) }
   }
 
   let restarting = false
@@ -365,6 +518,16 @@ if (window.SPEECH_SDK_FALLBACK) {
 
   connectWs()
   initAudio().catch(() => {})
+
+  // Show the engine before Start is pressed, so a minder can see at a glance
+  // that this hall is on the one the run sheet says it should be.
+  $('providerBadge').textContent = providerOverride || '…'
+  if (!providerOverride) {
+    fetch(BASE + 'api/config')
+      .then((r) => r.json())
+      .then((c) => { $('providerBadge').textContent = c.provider || '?' })
+      .catch(() => { $('providerBadge').textContent = '?' })
+  }
 })()
 </script>
 </body>

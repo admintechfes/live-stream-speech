@@ -14,6 +14,8 @@
     "spike": "node spike/azure-file-test.js"
   },
   "dependencies": {
+    "@soniox/node": "^2.3.0",
+    "@soniox/speech-to-text-web": "^1.4.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "microsoft-cognitiveservices-speech-sdk": "^1.41.0",

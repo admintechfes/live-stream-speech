@@ -7,6 +7,14 @@ const path = require('path')
 const http = require('http')
 const express = require('express')
 const { WebSocketServer } = require('ws')
+const {
+  azureLocalesToSonioxHints,
+  phraseListToContext,
+  resolveProvider,
+  validateProviderConfig,
+  issueAzureToken,
+  mintSonioxKey,
+} = require('./lib/providers')
 
 const PORT = Number(process.env.PORT || 8080)
 const HALLS = String(process.env.HALLS || 'hall-1')
@@ -16,8 +24,11 @@ const HALLS = String(process.env.HALLS || 'hall-1')
 const REPLAY_LINES = Number(process.env.REPLAY_LINES || 6)
 const CAPTION_DELAY_MS = Number(process.env.CAPTION_DELAY_MS || 0)
 const CONTROL_KEY = process.env.CONTROL_KEY || '' // guards capture + operator roles
+const SPEECH_PROVIDER = (process.env.SPEECH_PROVIDER || 'azure').trim().toLowerCase()
 const SPEECH_KEY = process.env.AZURE_SPEECH_KEY || ''
 const SPEECH_REGION = process.env.AZURE_SPEECH_REGION || ''
+const SONIOX_KEY = process.env.SONIOX_API_KEY || ''
+const SONIOX_MODEL = process.env.SONIOX_MODEL || 'stt-rt-v5'
 const SOURCE_LANGS = process.env.SOURCE_LANGS || 'ta-IN,hi-IN,en-IN'
 const TARGET_LANG = process.env.TARGET_LANG || 'en'
 const PHRASE_LIST = (process.env.PHRASE_LIST || '')
@@ -27,6 +38,15 @@ const PHRASE_LIST = (process.env.PHRASE_LIST || '')
 
 if (!HALLS.length) {
   console.error('HALLS is empty — refusing to start. Set HALLS=hall-1,hall-2,... in .env')
+  process.exit(1)
+}
+
+// Credentials are checked at boot, not at first Start. A hall minder pressing
+// Start at 9am is the wrong moment to find out the key is missing.
+const configProblems = validateProviderConfig(SPEECH_PROVIDER, process.env)
+if (configProblems.length) {
+  console.error(`SPEECH_PROVIDER=${SPEECH_PROVIDER} — refusing to start:`)
+  for (const p of configProblems) console.error(`  - ${p}`)
   process.exit(1)
 }
 
@@ -48,6 +68,7 @@ for (const id of HALLS) {
     frozen: false,
     lastCaptionTs: 0,
     lastPublisherTs: 0,
+    provider: null, // engine the live capture page reported, for the operator badge
     pending: new Set(), // in-flight delayed finals (timeout handles)
   })
 }
@@ -57,47 +78,66 @@ app.disable('x-powered-by')
 app.use(express.json())
 
 // ---------------------------------------------------------------------------
-// Azure short-lived auth token. The subscription key never reaches a browser.
-// Tokens are valid ~10 min; we cache for 8.
+// Short-lived credentials. Neither provider's real key ever reaches a browser.
+// One endpoint, two payload shapes — capture.html makes the same single call
+// either way and hands the result to whichever driver `provider` names.
 // ---------------------------------------------------------------------------
 
-let tokenCache = { token: '', expiresAt: 0 }
-
-async function issueSpeechToken() {
-  if (!SPEECH_KEY || !SPEECH_REGION) {
-    throw new Error('AZURE_SPEECH_KEY / AZURE_SPEECH_REGION not configured')
-  }
-  const now = Date.now()
-  if (tokenCache.token && now < tokenCache.expiresAt) return tokenCache.token
-
-  const url = `https://${SPEECH_REGION}.api.cognitive.microsoft.com/sts/v1.0/issueToken`
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Ocp-Apim-Subscription-Key': SPEECH_KEY, 'Content-Length': '0' },
-  })
-  if (!res.ok) throw new Error(`Azure token request failed: ${res.status} ${await res.text()}`)
-
-  tokenCache = { token: await res.text(), expiresAt: now + 8 * 60 * 1000 }
-  return tokenCache.token
-}
+const SOURCE_LANG_LIST = SOURCE_LANGS.split(',').map((s) => s.trim()).filter(Boolean)
 
 app.get('/api/token', requireControlKey, async (req, res) => {
+  let provider
   try {
+    provider = resolveProvider(req.query.provider, SPEECH_PROVIDER)
+  } catch (err) {
+    return res.status(err.status || 400).json({ error: err.message })
+  }
+
+  const problems = validateProviderConfig(provider, process.env)
+  if (problems.length) {
+    // Reachable only via ?provider= naming the engine this server was not
+    // configured for — the default provider is validated at boot.
+    return res.status(503).json({ error: `${provider} is not configured: ${problems.join('; ')}` })
+  }
+
+  try {
+    if (provider === 'soniox') {
+      const { apiKey, expiresAt } = await mintSonioxKey({
+        key: SONIOX_KEY,
+        clientReferenceId: String(req.query.hall || 'unknown-hall'),
+      })
+      return res.json({
+        provider,
+        apiKey,
+        expiresAt,
+        model: SONIOX_MODEL,
+        languageHints: azureLocalesToSonioxHints(SOURCE_LANG_LIST),
+        targetLanguage: TARGET_LANG,
+        context: phraseListToContext(PHRASE_LIST),
+      })
+    }
+
     res.json({
-      token: await issueSpeechToken(),
+      provider,
+      token: await issueAzureToken({ key: SPEECH_KEY, region: SPEECH_REGION }),
       region: SPEECH_REGION,
-      sourceLanguages: SOURCE_LANGS.split(',').map((s) => s.trim()).filter(Boolean),
+      sourceLanguages: SOURCE_LANG_LIST,
       targetLanguage: TARGET_LANG,
       phraseList: PHRASE_LIST,
     })
   } catch (err) {
-    console.error('[token]', err.message)
+    console.error('[token]', provider, err.message)
     res.status(500).json({ error: err.message })
   }
 })
 
 app.get('/api/config', (req, res) => {
-  res.json({ halls: HALLS, captionDelayMs: CAPTION_DELAY_MS, controlKeyRequired: Boolean(CONTROL_KEY) })
+  res.json({
+    halls: HALLS,
+    captionDelayMs: CAPTION_DELAY_MS,
+    controlKeyRequired: Boolean(CONTROL_KEY),
+    provider: SPEECH_PROVIDER,
+  })
 })
 
 app.get('/api/health', (req, res) => {
@@ -130,6 +170,21 @@ app.get('/vendor/speech-sdk.js', (req, res) => {
   res.type('application/javascript').sendFile(sdkBundle)
 })
 
+// Same deal for Soniox. This one is an ES module, imported dynamically by the
+// capture page only when that provider is actually in use.
+const sonioxBundle = path.join(
+  __dirname,
+  'node_modules',
+  '@soniox',
+  'speech-to-text-web',
+  'dist',
+  'speech-to-text-web.js'
+)
+app.get('/vendor/soniox-sdk.js', (req, res) => {
+  if (!fs.existsSync(sonioxBundle)) return res.status(404).send('// local Soniox SDK not installed')
+  res.type('application/javascript').sendFile(sonioxBundle)
+})
+
 app.get('/', (req, res) => res.redirect('/operator.html'))
 
 const server = http.createServer(app)
@@ -155,7 +210,13 @@ wss.on('connection', (ws, req) => {
     if (CONTROL_KEY && key !== CONTROL_KEY) return reject(ws, 'unauthorized', 'Bad control key.')
     ws.role = 'operator'
     for (const hall of halls.values()) hall.operators.add(ws)
-    send(ws, { type: 'hello', role: 'operator', halls: HALLS, captionDelayMs: CAPTION_DELAY_MS })
+    send(ws, {
+      type: 'hello',
+      role: 'operator',
+      halls: HALLS,
+      captionDelayMs: CAPTION_DELAY_MS,
+      defaultProvider: SPEECH_PROVIDER,
+    })
     send(ws, { type: 'health', halls: healthSnapshot() })
     ws.on('message', (raw) => guard('operator', () => handleOperatorMessage(ws, raw)))
     ws.on('close', () => {
@@ -186,7 +247,10 @@ wss.on('connection', (ws, req) => {
 
     ws.on('message', (raw) => guard(`publisher ${hallId}`, () => handlePublisherMessage(ws, hall, raw)))
     ws.on('close', () => {
-      if (hall.publisher === ws) hall.publisher = null
+      if (hall.publisher === ws) {
+        hall.publisher = null
+        hall.provider = null
+      }
       console.log(`[ws] publisher gone: ${hallId}`)
       broadcastHealth()
     })
@@ -240,6 +304,13 @@ function handlePublisherMessage(ws, hall, raw) {
     toScreens(hall, event)
     toOperators(hall, event)
   } else if (msg.type === 'status') {
+    // The capture page reports the engine it actually started, which during an
+    // A/B is the only trustworthy source — .env says nothing about a hall
+    // flipped with ?provider=.
+    if (msg.provider) {
+      hall.provider = String(msg.provider).slice(0, 24)
+      broadcastHealth()
+    }
     toOperators(hall, { type: 'publisher_status', hallId: ws.hallId, ...msg, ts: Date.now() })
   }
 }
@@ -346,6 +417,7 @@ function healthSnapshot() {
       screens: hall.screens.size,
       publisherLive: Boolean(hall.publisher && hall.publisher.readyState === hall.publisher.OPEN),
       lastCaptionAgeMs: hall.lastCaptionTs ? now - hall.lastCaptionTs : null,
+      provider: hall.provider,
       blanked: hall.blanked,
       frozen: hall.frozen,
     }
@@ -397,6 +469,7 @@ server.listen(PORT, () => {
   console.log(`  screens      : /screen.html?hall=${HALLS[0]}`)
   console.log(`  capture      : /capture.html?hall=${HALLS[0]}`)
   console.log(`  operator     : /operator.html`)
+  console.log(`  provider     : ${SPEECH_PROVIDER}${SPEECH_PROVIDER === 'soniox' ? ` (${SONIOX_MODEL})` : ` (${SPEECH_REGION})`}`)
   console.log(`  caption delay: ${CAPTION_DELAY_MS}ms`)
   console.log(`  control key  : ${CONTROL_KEY ? 'required' : 'NOT SET (open access)'}`)
 })
