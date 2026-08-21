@@ -40,11 +40,19 @@
   button.ctl.blank { background: #7a2418; border-color: #a03826; }
   button.ctl.blank.on { background: #d04a2a; border-color: #e8674a; }
   button.ctl.on { background: #3a6ea5; border-color: #4a8bd0; }
-  .caption {
-    margin-top: 12px; padding: 11px 13px; background: #0e1216; border-radius: 7px;
-    font-size: 16px; min-height: 46px; color: #c7d0da;
+  .langs { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+  .lrow {
+    flex: 1 1 320px; background: #0e1216; border: 1px solid #232b34;
+    border-radius: 7px; padding: 10px 12px;
   }
-  .caption .pre { color: #e0a92b; }
+  .lrow.dead { border-color: #7a3520; }
+  .lhead { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #8b97a5; margin-bottom: 7px; }
+  .lname { font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #c7d0da; }
+  .lage { margin-left: auto; }
+  .caption {
+    padding: 2px 0; font-size: 16px; min-height: 46px; color: #c7d0da;
+  }
+  .caption .pre { color: #FDB913; }
   .caption em { color: #6c7885; font-style: normal; }
   .badge {
     font-size: 10px; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase;
@@ -76,6 +84,8 @@
   const state = new Map() // hallId -> { el, blanked, frozen, lastText, previewText }
   let allBlanked = false
   let defaultProvider = ''
+  let languages = ['en']
+  const LANG_NAMES = { en: 'English', ta: 'தமிழ் Tamil', hi: 'हिन्दी Hindi' }
   let ws = null
   let backoff = 500
 
@@ -99,6 +109,7 @@
     switch (m.type) {
       case 'hello':
         defaultProvider = m.defaultProvider || ''
+        languages = (m.languages && m.languages.length) ? m.languages : ['en']
         if (m.captionDelayMs > 0) {
           $('delayNote').textContent = `${m.captionDelayMs}ms review delay — amber text has not reached the screens yet`
         }
@@ -120,9 +131,12 @@
       case 'partial': {
         const s = state.get(m.hallId)
         if (!s) return
-        if (m.type === 'preview') s.previewText = m.text
-        else { s.lastText = m.text; if (m.type === 'final') s.previewText = '' }
-        paintCaption(m.hallId)
+        const l = m.targetLang || languages[0]
+        const t = s.lang.get(l)
+        if (!t) return
+        if (m.type === 'preview') t.previewText = m.text
+        else { t.lastText = m.text; if (m.type === 'final') t.previewText = '' }
+        paintCaption(m.hallId, l)
         break
       }
     }
@@ -146,14 +160,27 @@
           <button class="ctl" data-act="bigger">A+</button>
         </div>
       </div>
-      <div class="caption" data-caption><em>waiting for captions…</em></div>
+      <div class="langs">${languages.map((l) => `
+        <div class="lrow" data-lrow="${l}">
+          <div class="lhead">
+            <span class="dot" data-ldot></span>
+            <span class="lname">${LANG_NAMES[l] || l}</span>
+            <span data-lscreens>0</span> screens
+            <span class="lage" data-lage>—</span>
+          </div>
+          <div class="caption" data-caption="${l}"><em>waiting for captions…</em></div>
+        </div>`).join('')}
+      </div>
       <div class="links">
-        <a href="${BASE}screen.html?hall=${hallId}&label=1" target="_blank">screen</a> ·
+        ${languages.map((l) => `<a href="${BASE}screen.html?hall=${hallId}&lang=${l}&label=1" target="_blank">screen ${l}</a>`).join(' · ')} ·
         <a href="${BASE}capture.html?hall=${hallId}${key ? '&key=' + encodeURIComponent(key) : ''}" target="_blank">capture</a>
       </div>`
     $('halls').appendChild(el)
 
-    const s = { el, blanked: false, frozen: false, lastText: '', previewText: '', size: 52 }
+    const s = {
+      el, blanked: false, frozen: false, size: 52,
+      lang: new Map(languages.map((l) => [l, { lastText: '', previewText: '' }])),
+    }
     state.set(hallId, s)
 
     el.querySelectorAll('button[data-act]').forEach((btn) => {
@@ -161,7 +188,11 @@
         const act = btn.dataset.act
         if (act === 'blank') send({ type: 'blank', hallId, value: !s.blanked })
         else if (act === 'freeze') { s.frozen = !s.frozen; send({ type: 'freeze', hallId, value: s.frozen }); btn.classList.toggle('on', s.frozen) }
-        else if (act === 'clear') { s.lastText = ''; s.previewText = ''; paintCaption(hallId); send({ type: 'clear', hallId }) }
+        else if (act === 'clear') {
+          // Clear is hall-wide, so the console must clear every language too.
+          for (const [l, t] of s.lang) { t.lastText = ''; t.previewText = ''; paintCaption(hallId, l) }
+          send({ type: 'clear', hallId })
+        }
         else if (act === 'bigger' || act === 'smaller') {
           s.size = Math.max(24, Math.min(110, s.size + (act === 'bigger' ? 4 : -4)))
           send({ type: 'style', hallId, size: s.size })
@@ -196,14 +227,39 @@
       ageEl.textContent = secs < 2 ? 'flowing' : `last caption ${secs}s ago`
       ageEl.style.color = secs > 25 ? '#e0a92b' : '#8b97a5'
     }
+
+    // Per-language rows. A hall whose Tamil session has died still reports a
+    // live publisher, so this is the only place that failure becomes visible.
+    for (const lh of h.languages || []) {
+      const row = el.querySelector(`[data-lrow="${lh.lang}"]`)
+      if (!row) continue
+      const stale = lh.lastCaptionAgeMs !== null && lh.lastCaptionAgeMs > 25000
+      const down = h.publisherLive && (!lh.live || stale)
+      row.classList.toggle('dead', down)
+      row.querySelector('[data-ldot]').className =
+        'dot ' + (!h.publisherLive ? '' : down ? 'err' : lh.lastCaptionAgeMs === null ? 'warn' : 'live')
+      row.querySelector('[data-lscreens]').textContent = lh.screens
+
+      const la = row.querySelector('[data-lage]')
+      if (!lh.live && h.publisherLive) la.textContent = 'SESSION DOWN'
+      else if (lh.lastCaptionAgeMs === null) la.textContent = 'no captions yet'
+      else {
+        const s2 = Math.round(lh.lastCaptionAgeMs / 1000)
+        la.textContent = s2 < 2 ? 'flowing' : `${s2}s ago`
+      }
+      la.style.color = down ? '#ff8a6a' : '#8b97a5'
+    }
   }
 
-  function paintCaption(hallId) {
+  function paintCaption(hallId, lang) {
     const s = state.get(hallId)
+    const t = s && s.lang.get(lang)
+    const el = s && s.el.querySelector(`[data-caption="${lang}"]`)
+    if (!t || !el) return
     const parts = []
-    if (s.lastText) parts.push(esc(s.lastText))
-    if (s.previewText) parts.push(`<span class="pre">${esc(s.previewText)}</span>`)
-    s.el.querySelector('[data-caption]').innerHTML = parts.join(' ') || '<em>waiting for captions…</em>'
+    if (t.lastText) parts.push(esc(t.lastText))
+    if (t.previewText) parts.push(`<span class="pre">${esc(t.previewText)}</span>`)
+    el.innerHTML = parts.join(' ') || '<em>waiting for captions…</em>'
   }
 
   const esc = (t) => String(t).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))

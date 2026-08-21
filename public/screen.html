@@ -81,16 +81,24 @@
   #dot.down { background: #d04a2a; opacity: 1; animation: pulse 1.1s infinite; }
   @keyframes pulse { 50% { opacity: 0.25; } }
 
-  #full {
+  #tools {
     position: fixed; bottom: max(12px, env(safe-area-inset-bottom)); left: 12px;
-    display: none; width: 44px; height: 44px;   /* 44px: a real touch target */
-    align-items: center; justify-content: center;
+    display: flex; gap: 8px; align-items: center;
+  }
+  #tools button {
+    min-width: 44px; height: 44px; padding: 0 14px;   /* 44px: a real touch target */
+    display: inline-flex; align-items: center; justify-content: center;
     background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.16);
-    border-radius: 10px; color: var(--brand); font-size: 19px; line-height: 1;
+    border-radius: 10px; color: var(--brand); font: inherit; font-size: 15px;
+    font-weight: 700; line-height: 1;
     cursor: pointer; -webkit-tap-highlight-color: transparent;
   }
+  #tools button.on { background: var(--brand); color: #000; border-color: var(--brand); }
+  #full { display: none; font-size: 19px; }
   /* Touch devices only — a hall TV should show no chrome at all. */
-  @media (hover: none) and (pointer: coarse) { #full { display: flex; } }
+  @media (hover: none) and (pointer: coarse) { #full { display: inline-flex !important; } }
+  #langs { display: none; gap: 8px; }
+  body.picker #langs { display: flex; }
 
   /* ---- fatal card ------------------------------------------------------- */
   #fatal {
@@ -99,7 +107,7 @@
   }
   #fatal h1 { font-size: clamp(30px, 7vw, 68px); color: #ff6a45; letter-spacing: 0.04em; }
   #fatal p { font-size: clamp(15px, 2.6vw, 26px); color: #98a2ad; margin-top: 18px; line-height: 1.5; }
-  body.fatal #captions, body.fatal #dot, body.fatal #bar, body.fatal #full { display: none; }
+  body.fatal #captions, body.fatal #dot, body.fatal #bar, body.fatal #tools { display: none; }
   body.fatal #fatal { display: block; }
 
   /* Landscape on a phone is mostly bezel — reclaim the vertical space. */
@@ -121,7 +129,10 @@
 
   <div id="captions" aria-live="polite"></div>
 
-  <button id="full" title="Fullscreen" aria-label="Toggle fullscreen">&#9974;</button>
+  <div id="tools">
+    <button id="full" title="Fullscreen" aria-label="Toggle fullscreen">&#9974;</button>
+    <div id="langs" role="group" aria-label="Caption language"></div>
+  </div>
   <div id="dot" class="down"></div>
   <div id="fatal"><h1 id="fatalTitle">NOT CONFIGURED</h1><p id="fatalBody"></p></div>
 
@@ -137,6 +148,15 @@
   // ?notice=0 removes it; ?notice=<text> replaces the wording.
   const notice = params.get('notice')
   const logo = params.get('logo')
+
+  // A URL that names a language is LOCKED to it — that is how hall TVs are
+  // pinned. A share link with no ?lang lets the viewer choose, and remembers.
+  const lockedLang = (params.get('lang') || '').trim().toLowerCase()
+  const LANG_NAMES = { en: 'English', ta: 'தமிழ்', hi: 'हिन्दी' }
+  const remembered = (() => {
+    try { return localStorage.getItem('captionLang') || '' } catch { return '' }
+  })()
+  let lang = lockedLang || remembered || ''
 
   const $ = (id) => document.getElementById(id)
   const $captions = $('captions')
@@ -193,7 +213,8 @@
 
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    ws = new WebSocket(`${proto}://${location.host}${BASE}ws?role=screen&hall=${encodeURIComponent(hall)}`)
+    const q = `role=screen&hall=${encodeURIComponent(hall)}` + (lang ? `&lang=${encodeURIComponent(lang)}` : '')
+    ws = new WebSocket(`${proto}://${location.host}${BASE}ws?${q}`)
 
     ws.onopen = () => { backoff = 500; $dot.classList.remove('down') }
 
@@ -202,6 +223,9 @@
       try { m = JSON.parse(ev.data) } catch { return }
       switch (m.type) {
         case 'hello':
+          // The server is authoritative about which language we actually got.
+          lang = m.lang || lang
+          buildPicker(m.languages || [])
           finals = m.finals || []
           partial = m.partial || ''
           blanked = Boolean(m.blanked)
@@ -234,7 +258,17 @@
           if (m.lines) { maxLines = m.lines; render() }
           break
         case 'error':
-          fatal(m.code === 'unknown_hall' ? 'UNKNOWN HALL' : 'NOT CONFIGURED', m.message)
+          // A remembered language the server no longer carries must not strand
+          // the viewer on a fatal card — drop it and take the default instead.
+          if (m.code === 'unknown_lang' && !lockedLang) {
+            try { localStorage.removeItem('captionLang') } catch {}
+            lang = ''
+            return
+          }
+          fatal(
+            m.code === 'unknown_hall' ? 'UNKNOWN HALL' : m.code === 'unknown_lang' ? 'UNKNOWN LANGUAGE' : 'NOT CONFIGURED',
+            m.message
+          )
           ws.onclose = null
           break
       }
@@ -249,6 +283,42 @@
       backoff = Math.min(backoff * 1.7, 8000)
     }
     ws.onerror = () => ws.close()
+  }
+
+  // ---- language picker ------------------------------------------------------
+  // Only for viewers on their own devices. A hall TV opened with ?lang= is
+  // pinned and shows no picker at all.
+
+  let pickerBuilt = false
+
+  function buildPicker(languages) {
+    if (pickerBuilt || lockedLang || languages.length < 2) return
+    pickerBuilt = true
+    document.body.classList.add('picker')
+    $('langs').innerHTML = languages
+      .map((l) => `<button data-lang="${l}">${LANG_NAMES[l] || l.toUpperCase()}</button>`)
+      .join('')
+    $('langs').querySelectorAll('button').forEach((b) => {
+      b.onclick = () => switchLang(b.dataset.lang)
+    })
+    markPicker()
+  }
+
+  function markPicker() {
+    $('langs').querySelectorAll('button').forEach((b) => {
+      b.classList.toggle('on', b.dataset.lang === lang)
+    })
+  }
+
+  function switchLang(next) {
+    if (next === lang) return
+    lang = next
+    try { localStorage.setItem('captionLang', next) } catch {}
+    markPicker()
+    // Reconnect on the new language. The server replays that language's buffer
+    // in hello, so the screen repaints immediately rather than going blank.
+    if (ws) { ws.onclose = null; ws.close() }
+    connect()
   }
 
   connect()

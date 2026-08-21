@@ -27,11 +27,41 @@ npm start
 
 | Page | URL | Who opens it |
 |---|---|---|
-| Screen | `/screen.html?hall=hall-1` | Every TV/projector in that hall |
+| Screen (hall TV) | `/screen.html?hall=hall-1&lang=en` | Every TV/projector in that hall |
+| Screen (audience) | `/screen.html?hall=hall-1` | Share link — viewer picks their own language |
 | Capture | `/capture.html?hall=hall-1&key=…` | The capture laptop in that hall, one per hall |
 | Operator | `/operator.html?key=…` | The roaming lead |
 
 Screens need no key. Capture and operator do, once `CONTROL_KEY` is set.
+
+## Languages
+
+`SOURCE_LANGS` is what a **speaker** may use; `TARGET_LANGS` is what a **viewer** may read. They are
+independent: a Tamil sentence, a Hindi sentence and an English sentence all feed **every** target
+language, so no screen ever goes quiet because the speaker switched language mid-talk.
+
+```
+SOURCE_LANGS=ta-IN,hi-IN,en-IN     # spoken
+TARGET_LANGS=en,ta                 # read — first entry is the default
+```
+
+A URL that names a language is **locked** to it (`&lang=ta`) — that is how hall TVs are pinned. A
+link with no `lang` shows a picker and remembers the viewer's choice, which is the link to give the
+audience.
+
+How both streams stay live when the speaker is already in one of the target languages: a Soniox
+`one_way` session with target `L` emits `translation` tokens for other languages, and `original`
+tokens once the speech is already in `L`. Each language driver keeps translations always, plus
+originals whose detected language matches its own target. Mid-sentence code-switching therefore
+works out on its own — the `en` stream takes translated text for the Tamil half of a sentence and
+original text for the English half, and `ta` does the mirror image.
+
+**Cost and concurrency scale with languages on Soniox**, which translates to one target per session:
+`4 halls × 2 languages = 8 concurrent streams`. Confirm the account allows that before adding a
+third language. Azure does every target in one session, so it does not scale this way.
+
+Blank, Freeze and Clear are deliberately **hall-wide, across every language**. Blanking English
+while the Tamil screens keep showing the same sentence would defeat the point of the button.
 
 ## Speech engine
 
@@ -110,13 +140,17 @@ deployed VM before doors open.
 | `hall` | **Required.** No hall, or an unknown one, shows a large NOT CONFIGURED card rather than guessing |
 | `size` | Caption font size in px (default 52). Tune from the back row, not the laptop. On phones this is automatically capped to the viewport, so one URL serves both a hall wall and a handset |
 | `lines` | Visible lines (default 3) |
+| `lang` | Locks the screen to one language and hides the picker. Omit it on the audience share link so viewers can choose |
 | `label=1` | Shows the hall name in the corner — use during setup to confirm each wall is on the right channel |
 | `notice` | The standing "AI-generated translation · may contain errors" disclaimer, top-right. **On by default.** `notice=0` hides it; `notice=<text>` replaces the wording (e.g. a Tamil translation of it) |
 | `logo=0` | Hides the Madhi logo (top-left). Shown by default |
 
 ## Operator console
 
-One row per hall: capture-live dot, screen count, last-caption age, and the live caption text.
+One row per hall — capture-live dot, engine badge, screen count, last-caption age — and beneath it
+**one sub-row per language** with its own live dot, screen count, age and caption text. A hall
+reading `SESSION DOWN` on Tamil while English keeps flowing is the failure that is otherwise
+invisible: the publisher is still connected, so the hall looks healthy.
 
 - **Blank** — per hall. The button that matters. Instantly hides captions and discards anything
   still inside the review delay.
@@ -233,6 +267,10 @@ reconnect storms when the relay restarts (viewers back off with jitter for exact
 - [ ] `CONTROL_KEY` set; capture/operator URLs distributed only to staff
 - [ ] Azure concurrency limit confirmed for 4 simultaneous streams
 - [ ] Cross-talk test: publish to each hall, confirm the other three stay untouched
+- [ ] `--target=` spike run per language on mixed Tamil/Hindi/English audio; every spoken segment
+      produces output in **both** targets
+- [ ] Soniox concurrency limit confirmed for `halls × languages` simultaneous streams
+- [ ] Blank pressed once with both an `en` and a `ta` screen open — **both** go dark
 - [ ] Per-hall kit: laptop, USB interface, XLR, hotspot pre-paired and failover tested
 - [ ] Mixer line-out confirmed in every hall — never a room mic; peaks near −12 dBFS
 - [ ] Legibility checked from the back row of each hall
@@ -245,12 +283,15 @@ reconnect storms when the relay restarts (viewers back off with jitter for exact
 ```
 HALL: hall-2                      MINDER: ______________
 
-Screens : https://captions.example.org/screen.html?hall=hall-2
-Capture : https://captions.example.org/capture.html?hall=hall-2&key=…
+Screen EN : https://captions.example.org/screen.html?hall=hall-2&lang=en
+Screen TA : https://captions.example.org/screen.html?hall=hall-2&lang=ta
+Audience  : https://captions.example.org/screen.html?hall=hall-2   (they pick)
+Capture   : https://captions.example.org/capture.html?hall=hall-2&key=…
 Lead    : ______________  (radio channel ___)
 
 Captions frozen or wrong        -> Blank, then reload the capture page and press Start
 Captions stopped                -> check the capture page dot; press Stop then Start
+One language dead, other fine   -> capture page, press Stop then Start (both restart together)
 Engine misbehaving all talk     -> reload capture with &provider=______ and press Start
 Screen black                    -> reload the screen URL; check it says hall-2 top-left
 Everything down                 -> switch the capture laptop to the backup hotspot

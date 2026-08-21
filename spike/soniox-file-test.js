@@ -8,6 +8,12 @@
  *   node spike/azure-file-test.js  sample-tamil.wav
  *   node spike/soniox-file-test.js sample-tamil.wav
  *
+ * Run it once per target language to prove both streams stay alive whatever is
+ * being spoken — the requirement the whole multi-language design rests on:
+ *
+ *   node spike/soniox-file-test.js --target=en mixed-ta-hi-en.wav
+ *   node spike/soniox-file-test.js --target=ta mixed-ta-hi-en.wav
+ *
  * Input must be 16 kHz, 16-bit, mono WAV:
  *   ffmpeg -i raw.m4a -ar 16000 -ac 1 -c:a pcm_s16le sample-tamil.wav
  *
@@ -22,9 +28,11 @@ const path = require('path')
 const { SonioxNodeClient } = require('@soniox/node')
 const { azureLocalesToSonioxHints, phraseListToContext } = require('../lib/providers')
 
-const file = process.argv[2]
+const argv = process.argv.slice(2)
+const targetArg = (argv.find((a) => a.startsWith('--target=')) || '').split('=')[1]
+const file = argv.find((a) => !a.startsWith('--'))
 if (!file) {
-  console.error('usage: node spike/soniox-file-test.js <16k-mono.wav>')
+  console.error('usage: node spike/soniox-file-test.js [--target=ta] <16k-mono.wav>')
   process.exit(1)
 }
 if (!fs.existsSync(file)) {
@@ -41,7 +49,10 @@ if (!KEY) {
 const MODEL = process.env.SONIOX_MODEL || 'stt-rt-v5'
 const SOURCES = (process.env.SOURCE_LANGS || 'ta-IN,hi-IN,en-IN').split(',').map((s) => s.trim())
 const HINTS = azureLocalesToSonioxHints(SOURCES)
-const TARGET = process.env.TARGET_LANG || 'en'
+// --target wins, then the first configured target language, then English.
+const TARGET =
+  targetArg ||
+  String(process.env.TARGET_LANGS || process.env.TARGET_LANG || 'en').split(',')[0].trim()
 const CONTEXT = phraseListToContext(
   (process.env.PHRASE_LIST || '').split(',').map((p) => p.trim()).filter(Boolean)
 )
@@ -95,6 +106,14 @@ function flush() {
   console.log(`[${String(at).padStart(6)}s] (${lastLang}, settle ${String(settle).padStart(4)}ms)  ${text}`)
 }
 
+// This breakdown is the whole point of the flag. It answers the question the
+// design depends on: when the speaker is ALREADY in the target language, does
+// Soniox emit `original` tokens (so we can fall back to them and keep the
+// stream alive), and does it avoid emitting a redundant translation as well?
+const tokenStats = new Map() // "status/language" -> count
+const base = (c) => String(c || '?').toLowerCase().split(/[-_]/)[0]
+const TARGET_BASE = base(TARGET)
+
 session.on('result', (result) => {
   const now = Date.now()
   if (firstPartialAt === null) firstPartialAt = now
@@ -102,7 +121,15 @@ session.on('result', (result) => {
 
   for (const t of result.tokens || []) {
     if (t.text === '<end>' || t.text === '<fin>') continue
-    if (t.translation_status && t.translation_status !== 'translation') continue
+    const status = t.translation_status || 'none'
+    const tl = base(t.language || t.source_language)
+    const k = `${status} / ${tl}`
+    tokenStats.set(k, (tokenStats.get(k) || 0) + 1)
+
+    // The same keep-rule the capture page applies, so what prints here is
+    // exactly what a screen would show.
+    const keep = status === 'translation' || tl === TARGET_BASE
+    if (!keep) continue
     if (t.source_language || t.language) lastLang = t.source_language || t.language
     if (t.is_final) finalBuffer += t.text
   }
@@ -147,7 +174,19 @@ function finish(code = 0) {
   console.log(`settle p50 / p95  : ${pct(50)} / ${pct(95)}`)
   console.log(`first partial     : ${firstPartialAt ? firstPartialAt - startedAt + 'ms after start' : 'never'}`)
   console.log(`languages detected: ${[...langCounts].map(([l, n]) => `${l}×${n}`).join(', ') || 'none'}`)
+  console.log(`\ntokens by status / language  (target = ${TARGET_BASE}):`)
+  for (const [k, n] of [...tokenStats].sort((a, b) => b[1] - a[1])) {
+    const [status, tl] = k.split(' / ')
+    const kept = status === 'translation' || tl === TARGET_BASE
+    console.log(`  ${kept ? 'KEEP' : 'drop'}  ${k.padEnd(20)} ${n}`)
+  }
   console.log('-'.repeat(60))
+  console.log('READ THIS FIRST: every spoken segment must produce KEEP tokens. If a')
+  console.log(`stretch spoken in ${TARGET_BASE} shows no "original / ${TARGET_BASE}" rows, the`)
+  console.log('fallback is not firing and that language will go blank when the')
+  console.log('speaker switches into it. If you see BOTH translation and original')
+  console.log(`rows for ${TARGET_BASE}, text will double and originals must be dropped.`)
+  console.log('')
   console.log('Judge the TEXT by eye against the audio, and against the Azure run')
   console.log('on the same clip — that comparison is the whole point of this tool.')
   console.log('Audio here is paced at realtime, so settle times are closer to live')

@@ -30,7 +30,13 @@ const SPEECH_REGION = process.env.AZURE_SPEECH_REGION || ''
 const SONIOX_KEY = process.env.SONIOX_API_KEY || ''
 const SONIOX_MODEL = process.env.SONIOX_MODEL || 'stt-rt-v5'
 const SOURCE_LANGS = process.env.SOURCE_LANGS || 'ta-IN,hi-IN,en-IN'
-const TARGET_LANG = process.env.TARGET_LANG || 'en'
+// Every hall carries all of these at once. The first entry is the default: what
+// a viewer reads before choosing, and where an untagged caption event routes.
+const TARGET_LANGS = String(process.env.TARGET_LANGS || process.env.TARGET_LANG || 'en')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean)
+const DEFAULT_LANG = TARGET_LANGS[0]
 const PHRASE_LIST = (process.env.PHRASE_LIST || '')
   .split(',')
   .map((p) => p.trim())
@@ -38,6 +44,10 @@ const PHRASE_LIST = (process.env.PHRASE_LIST || '')
 
 if (!HALLS.length) {
   console.error('HALLS is empty — refusing to start. Set HALLS=hall-1,hall-2,... in .env')
+  process.exit(1)
+}
+if (!TARGET_LANGS.length) {
+  console.error('TARGET_LANGS is empty — refusing to start. Set TARGET_LANGS=en,ta in .env')
   process.exit(1)
 }
 
@@ -55,15 +65,22 @@ if (configProblems.length) {
 // connects first — a typo'd URL must fail loudly rather than open a ghost hall.
 // ---------------------------------------------------------------------------
 
-/** @type {Map<string, {screens:Set, operators:Set, publisher:any, finals:string[], partial:string, blanked:boolean, frozen:boolean, lastCaptionTs:number, lastPublisherTs:number, pending:Set}>} */
+// Caption content is per-language. Every safety control — blank, freeze, clear —
+// stays hall-wide: blanking English while Tamil screens keep showing the same
+// sentence would defeat the entire point of the button.
 const halls = new Map()
 for (const id of HALLS) {
   halls.set(id, {
-    screens: new Set(),
     operators: new Set(),
     publisher: null,
-    finals: [],
-    partial: '',
+    // one entry per target language, created up-front so a missing language is
+    // always a config error and never an accident of who connected first
+    screens: new Map(TARGET_LANGS.map((l) => [l, new Set()])),
+    finals: new Map(TARGET_LANGS.map((l) => [l, []])),
+    partial: new Map(TARGET_LANGS.map((l) => [l, ''])),
+    // One publisher per hall, but N sessions inside it. Without per-language
+    // health a dead Tamil session is invisible: the publisher is still live.
+    langHealth: new Map(TARGET_LANGS.map((l) => [l, { live: false, lastCaptionTs: 0 }])),
     blanked: false,
     frozen: false,
     lastCaptionTs: 0,
@@ -112,7 +129,7 @@ app.get('/api/token', requireControlKey, async (req, res) => {
         expiresAt,
         model: SONIOX_MODEL,
         languageHints: azureLocalesToSonioxHints(SOURCE_LANG_LIST),
-        targetLanguage: TARGET_LANG,
+        targetLanguages: TARGET_LANGS,
         context: phraseListToContext(PHRASE_LIST),
       })
     }
@@ -122,7 +139,7 @@ app.get('/api/token', requireControlKey, async (req, res) => {
       token: await issueAzureToken({ key: SPEECH_KEY, region: SPEECH_REGION }),
       region: SPEECH_REGION,
       sourceLanguages: SOURCE_LANG_LIST,
-      targetLanguage: TARGET_LANG,
+      targetLanguages: TARGET_LANGS,
       phraseList: PHRASE_LIST,
     })
   } catch (err) {
@@ -137,6 +154,8 @@ app.get('/api/config', (req, res) => {
     captionDelayMs: CAPTION_DELAY_MS,
     controlKeyRequired: Boolean(CONTROL_KEY),
     provider: SPEECH_PROVIDER,
+    targetLanguages: TARGET_LANGS,
+    defaultLanguage: DEFAULT_LANG,
   })
 })
 
@@ -216,6 +235,7 @@ wss.on('connection', (ws, req) => {
       halls: HALLS,
       captionDelayMs: CAPTION_DELAY_MS,
       defaultProvider: SPEECH_PROVIDER,
+      languages: TARGET_LANGS,
     })
     send(ws, { type: 'health', halls: healthSnapshot() })
     ws.on('message', (raw) => guard('operator', () => handleOperatorMessage(ws, raw)))
@@ -250,6 +270,8 @@ wss.on('connection', (ws, req) => {
       if (hall.publisher === ws) {
         hall.publisher = null
         hall.provider = null
+        // Every language session died with the page that hosted them.
+        for (const h of hall.langHealth.values()) h.live = false
       }
       console.log(`[ws] publisher gone: ${hallId}`)
       broadcastHealth()
@@ -257,21 +279,30 @@ wss.on('connection', (ws, req) => {
     return
   }
 
-  // Screen.
+  // Screen. A language it cannot serve is refused rather than served empty —
+  // a viewer must never sit in front of a silently blank screen wondering.
+  const lang = (url.searchParams.get('lang') || DEFAULT_LANG).trim().toLowerCase()
+  if (!hall.screens.has(lang)) {
+    return reject(ws, 'unknown_lang', `Unknown language "${lang}". Available: ${TARGET_LANGS.join(', ')}.`)
+  }
+
   ws.role = 'screen'
-  hall.screens.add(ws)
+  ws.lang = lang
+  hall.screens.get(lang).add(ws)
   send(ws, {
     type: 'hello',
     role: 'screen',
     hallId,
+    lang,
+    languages: TARGET_LANGS,
     blanked: hall.blanked,
     frozen: hall.frozen,
-    finals: hall.finals.slice(-REPLAY_LINES),
-    partial: hall.partial,
+    finals: hall.finals.get(lang).slice(-REPLAY_LINES),
+    partial: hall.partial.get(lang),
   })
   broadcastHealth()
   ws.on('close', () => {
-    hall.screens.delete(ws)
+    hall.screens.get(lang).delete(ws)
     broadcastHealth()
   })
 })
@@ -286,23 +317,48 @@ function handlePublisherMessage(ws, hall, raw) {
   hall.lastPublisherTs = Date.now()
 
   if (msg.type === 'partial' || msg.type === 'final') {
-    const text = String(msg.text || '').trim()
-    if (!text) return
-    const event = {
-      type: msg.type,
-      hallId: ws.hallId,
-      text,
-      lang: msg.lang || null,
-      ts: Date.now(),
+    // Three accepted shapes, all resolving to (language -> text) pairs:
+    //   { text, targetLang }  one session per language (Soniox)
+    //   { texts: {en, ta} }   one session, many targets  (Azure)
+    //   { text }              untagged -> the default language
+    const pairs = []
+    if (msg.texts && typeof msg.texts === 'object') {
+      for (const [l, t] of Object.entries(msg.texts)) pairs.push([String(l).toLowerCase(), t])
+    } else {
+      pairs.push([String(msg.targetLang || DEFAULT_LANG).toLowerCase(), msg.text])
     }
-    if (msg.type === 'final') return emitFinal(hall, event)
-    // With a review delay configured we suppress partials — showing them would
-    // leak the un-reviewed text ahead of the delayed finals.
-    if (CAPTION_DELAY_MS > 0) return
-    hall.partial = text
-    hall.lastCaptionTs = event.ts
-    toScreens(hall, event)
-    toOperators(hall, event)
+
+    for (const [targetLang, value] of pairs) {
+      const text = String(value || '').trim()
+      // A language this server does not carry is dropped, not invented: halls
+      // and languages are both declared in config, never by whoever connects.
+      if (!text || !hall.screens.has(targetLang)) continue
+
+      const event = {
+        type: msg.type,
+        hallId: ws.hallId,
+        targetLang,
+        text,
+        lang: msg.lang || null, // detected SOURCE language, for diagnostics
+        ts: Date.now(),
+      }
+
+      const health = hall.langHealth.get(targetLang)
+      health.live = true
+      health.lastCaptionTs = event.ts
+
+      if (msg.type === 'final') {
+        emitFinal(hall, targetLang, event)
+        continue
+      }
+      // With a review delay configured we suppress partials — showing them
+      // would leak un-reviewed text ahead of the delayed finals.
+      if (CAPTION_DELAY_MS > 0) continue
+      hall.partial.set(targetLang, text)
+      hall.lastCaptionTs = event.ts
+      toScreens(hall, targetLang, event)
+      toOperators(hall, event)
+    }
   } else if (msg.type === 'status') {
     // The capture page reports the engine it actually started, which during an
     // A/B is the only trustworthy source — .env says nothing about a hall
@@ -311,20 +367,28 @@ function handlePublisherMessage(ws, hall, raw) {
       hall.provider = String(msg.provider).slice(0, 24)
       broadcastHealth()
     }
+    // Per-session liveness. One publisher hosts N language sessions; without
+    // this a dead Tamil session hides behind a live publisher dot.
+    if (msg.state === 'session' && hall.langHealth.has(String(msg.targetLang || '').toLowerCase())) {
+      hall.langHealth.get(String(msg.targetLang).toLowerCase()).live = Boolean(msg.live)
+      broadcastHealth()
+    }
     toOperators(hall, { type: 'publisher_status', hallId: ws.hallId, ...msg, ts: Date.now() })
   }
 }
 
-function emitFinal(hall, event) {
+function emitFinal(hall, targetLang, event) {
   let handle = null
   const deliver = () => {
     if (handle) hall.pending.delete(handle)
     if (hall.blanked || hall.frozen) return // decided at fire time, not queue time
-    hall.finals.push(event.text)
-    if (hall.finals.length > 200) hall.finals.splice(0, hall.finals.length - 200)
-    hall.partial = ''
+    const finals = hall.finals.get(targetLang)
+    finals.push(event.text)
+    if (finals.length > 200) finals.splice(0, finals.length - 200)
+    hall.partial.set(targetLang, '')
     hall.lastCaptionTs = Date.now()
-    toScreens(hall, event)
+    hall.langHealth.get(targetLang).lastCaptionTs = hall.lastCaptionTs
+    toScreens(hall, targetLang, event)
     toOperators(hall, event)
   }
   if (CAPTION_DELAY_MS <= 0) return deliver()
@@ -348,24 +412,29 @@ function handleOperatorMessage(ws, raw) {
   for (const id of targets) {
     const hall = halls.get(id)
     switch (msg.type) {
+      // Every control below is hall-wide, across all languages. Blanking one
+      // language while another keeps showing the same sentence would defeat
+      // the entire purpose of the button.
       case 'blank':
         hall.blanked = Boolean(msg.value)
         if (hall.blanked) dropPending(hall)
-        toScreens(hall, { type: 'blank', hallId: id, value: hall.blanked })
+        toAllScreens(hall, { type: 'blank', hallId: id, value: hall.blanked })
         console.log(`[op] ${id} blank=${hall.blanked}`)
         break
       case 'freeze':
         hall.frozen = Boolean(msg.value)
-        toScreens(hall, { type: 'freeze', hallId: id, value: hall.frozen })
+        toAllScreens(hall, { type: 'freeze', hallId: id, value: hall.frozen })
         break
       case 'clear':
         dropPending(hall)
-        hall.finals = []
-        hall.partial = ''
-        toScreens(hall, { type: 'clear', hallId: id })
+        for (const l of TARGET_LANGS) {
+          hall.finals.set(l, [])
+          hall.partial.set(l, '')
+        }
+        toAllScreens(hall, { type: 'clear', hallId: id })
         break
       case 'style':
-        toScreens(hall, { type: 'style', hallId: id, size: msg.size, lines: msg.lines })
+        toAllScreens(hall, { type: 'style', hallId: id, size: msg.size, lines: msg.lines })
         break
       default:
         break
@@ -397,10 +466,22 @@ function reject(ws, code, message) {
   ws.close(4000, code)
 }
 
-function toScreens(hall, event) {
+function toScreens(hall, lang, event) {
+  if (hall.blanked && event.type !== 'blank') return
+  const subscribers = hall.screens.get(lang)
+  if (!subscribers) return
+  const payload = JSON.stringify(event)
+  for (const s of subscribers) if (s.readyState === s.OPEN) s.send(payload)
+}
+
+// Control events only. Caption content is never sent this way — that is what
+// keeps Tamil text off an English screen.
+function toAllScreens(hall, event) {
   if (hall.blanked && event.type !== 'blank') return
   const payload = JSON.stringify(event)
-  for (const s of hall.screens) if (s.readyState === s.OPEN) s.send(payload)
+  for (const subscribers of hall.screens.values()) {
+    for (const s of subscribers) if (s.readyState === s.OPEN) s.send(payload)
+  }
 }
 
 function toOperators(hall, event) {
@@ -412,14 +493,27 @@ function healthSnapshot() {
   const now = Date.now()
   return HALLS.map((id) => {
     const hall = halls.get(id)
+    let screens = 0
+    for (const set of hall.screens.values()) screens += set.size
     return {
       hallId: id,
-      screens: hall.screens.size,
+      screens,
       publisherLive: Boolean(hall.publisher && hall.publisher.readyState === hall.publisher.OPEN),
       lastCaptionAgeMs: hall.lastCaptionTs ? now - hall.lastCaptionTs : null,
       provider: hall.provider,
       blanked: hall.blanked,
       frozen: hall.frozen,
+      // Per-language, so a dead Tamil session is visible on the console rather
+      // than hidden behind a publisher that is still technically connected.
+      languages: TARGET_LANGS.map((l) => {
+        const h = hall.langHealth.get(l)
+        return {
+          lang: l,
+          screens: hall.screens.get(l).size,
+          live: h.live,
+          lastCaptionAgeMs: h.lastCaptionTs ? now - h.lastCaptionTs : null,
+        }
+      }),
     }
   })
 }
@@ -466,7 +560,8 @@ server.on('error', (err) => {
 server.listen(PORT, () => {
   console.log(`event-captions listening on :${PORT}`)
   console.log(`  halls        : ${HALLS.join(', ')}`)
-  console.log(`  screens      : /screen.html?hall=${HALLS[0]}`)
+  console.log(`  languages    : ${TARGET_LANGS.join(', ')} (default ${DEFAULT_LANG})`)
+  console.log(`  screens      : /screen.html?hall=${HALLS[0]}&lang=${DEFAULT_LANG}`)
   console.log(`  capture      : /capture.html?hall=${HALLS[0]}`)
   console.log(`  operator     : /operator.html`)
   console.log(`  provider     : ${SPEECH_PROVIDER}${SPEECH_PROVIDER === 'soniox' ? ` (${SONIOX_MODEL})` : ` (${SPEECH_REGION})`}`)

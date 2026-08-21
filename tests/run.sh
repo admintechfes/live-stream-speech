@@ -4,7 +4,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-cleanup() { for p in 8098 8099; do lsof -ti tcp:$p 2>/dev/null | xargs -r kill; done; }
+cleanup() { for p in 8097 8098 8099; do lsof -ti tcp:$p 2>/dev/null | xargs -r kill; done; }
 trap cleanup EXIT
 cleanup; sleep 0.5
 
@@ -35,6 +35,12 @@ echo "=== relay: isolation, hall validation, publisher lock, replay, health ==="
 PORT=8099 HALLS=hall-1,hall-2,hall-3,hall-4 CONTROL_KEY= CAPTION_DELAY_MS=0 node server.js >/dev/null 2>&1 &
 sleep 1.3
 node tests/relay.test.js || fail=1
+
+echo
+echo "=== multi-language: per-language routing, replay, health, hall-wide blank ==="
+PORT=8097 HALLS=hall-1,hall-2 TARGET_LANGS=en,ta CONTROL_KEY= CAPTION_DELAY_MS=0 node server.js >/dev/null 2>&1 &
+sleep 1.3
+node tests/multilang.test.js || fail=1
 
 echo
 echo "=== review delay + control key ==="

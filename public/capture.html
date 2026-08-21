@@ -35,9 +35,18 @@
   #meter { height: 12px; background: #0e1216; border-radius: 6px; overflow: hidden; border: 1px solid #333e4a; }
   #meterFill { height: 100%; width: 0%; background: linear-gradient(90deg, #2fbf6a 0 62%, #e0a92b 62% 85%, #d04a2a 85%); transition: width 60ms linear; }
   .hint { font-size: 12px; color: #8b97a5; margin-top: 6px; }
-  #monitor { min-height: 130px; font-size: 17px; line-height: 1.5; }
-  #monitor .fin { margin-bottom: 7px; }
-  #monitor .par { color: #8b97a5; }
+  #monitors { display: flex; gap: 14px; flex-wrap: wrap; }
+  .lang {
+    flex: 1 1 300px; background: #0e1216; border: 1px solid #29323c;
+    border-radius: 8px; padding: 12px 14px;
+  }
+  .langhead { display: flex; align-items: center; gap: 8px; margin-bottom: 9px; }
+  .langname { font-weight: 700; font-size: 13px; letter-spacing: 0.05em; text-transform: uppercase; }
+  .langage { margin-left: auto; font-size: 12px; color: #8b97a5; }
+  .langtext { min-height: 104px; font-size: 16px; line-height: 1.45; }
+  .langtext .fin { margin-bottom: 6px; }
+  .langtext .par { color: #FDB913; }
+  .langtext em { color: #6c7885; font-style: normal; }
   #log { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #7d8895; max-height: 150px; overflow-y: auto; white-space: pre-wrap; }
   .badge {
     font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
@@ -78,8 +87,8 @@
   </div>
 
   <div class="card">
-    <label>Live monitor</label>
-    <div id="monitor"></div>
+    <label>Live monitor — every language must be moving</label>
+    <div id="monitors"><em style="color:#6c7885">press Start</em></div>
   </div>
 
   <div class="card">
@@ -129,12 +138,13 @@ if (window.SPEECH_SDK_FALLBACK && (new URLSearchParams(location.search).get('pro
   let cfg = null          // whatever /api/token returned for the active provider
   let ws = null
   let wsBackoff = 500
-  let driver = null       // { stop(), refreshCredential? } — Azure or Soniox
+  let drivers = []        // one per target language (Soniox) or one for all (Azure)
+  let targets = []        // the target languages this hall is carrying
+  let sharedStream = null // one microphone, shared across every language session
   let running = false
   let lastEventTs = 0
   let tokenTimer = null
   let watchdogTimer = null
-  let finals = []
 
   // ---- relay ---------------------------------------------------------------
 
@@ -227,48 +237,69 @@ if (window.SPEECH_SDK_FALLBACK && (new URLSearchParams(location.search).get('pro
     return res.json()
   }
 
-  async function startRecognizer() {
-    cfg = await fetchToken()
-    $('providerBadge').textContent = cfg.provider
-
-    const handlers = {
-      onEvent: () => { lastEventTs = Date.now() },
+  function handlersFor(targetLang) {
+    return {
+      onEvent: () => { lastEventTs = Date.now(); markLang(targetLang) },
       onPartial: (text, lang) => {
         if (!text) return
-        publish({ type: 'partial', text, lang })
-        paint(text, true)
+        publish({ type: 'partial', text, targetLang, lang })
+        paintLang(targetLang, text, true)
       },
       onFinal: (text, lang) => {
         if (!text || !text.trim()) return
-        publish({ type: 'final', text, lang })
-        finals.push(text)
-        if (finals.length > 8) finals.shift()
-        paint('', false)
+        publish({ type: 'final', text, targetLang, lang })
+        paintLang(targetLang, text, false)
       },
-      onLog: log,
+      onLog: (m) => log(`[${targetLang}] ${m}`),
       onRetry: (reason) => {
-        setRec('err', reason)
-        if (running) restart(reason)
+        // One dead session must be visible on the operator console even while
+        // the other keeps producing — otherwise a live publisher hides it.
+        publish({ type: 'status', state: 'session', targetLang, live: false })
+        setRec('err', `${targetLang}: ${reason}`)
+        if (running) restart(`${targetLang}: ${reason}`)
       },
     }
+  }
 
-    const make = cfg.provider === 'soniox' ? sonioxDriver : azureDriver
-    driver = await make(cfg, $('device').value, handlers)
+  async function startRecognizer() {
+    cfg = await fetchToken()
+    $('providerBadge').textContent = cfg.provider
+    targets = (cfg.targetLanguages && cfg.targetLanguages.length) ? cfg.targetLanguages : ['en']
+    buildMonitors(targets)
+
+    if (cfg.provider === 'soniox') {
+      // Soniox translates to ONE target per session, so N languages means N
+      // sessions. They share a single microphone stream: opening the device
+      // twice would mean a second permission prompt and device contention.
+      sharedStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: { exact: $('device').value },
+          echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+        },
+      })
+      for (const lang of targets) {
+        drivers.push(await sonioxDriver(cfg, lang, sharedStream, handlersFor(lang)))
+      }
+    } else {
+      // Azure does every target in one session, so the whole hall costs the
+      // same whether it carries one language or three.
+      drivers.push(await azureDriver(cfg, targets, $('device').value, handlersFor))
+    }
 
     lastEventTs = Date.now()
     setRec('live', 'recognizing')
-    log(`recognizer started (${cfg.provider})`)
-    // Tells the operator console which engine this hall is actually on, which
-    // during an A/B is the only trustworthy source.
+    log(`recognizer started (${cfg.provider}, ${targets.join(' + ')})`)
     publish({ type: 'status', state: 'started', provider: cfg.provider })
+    for (const lang of targets) publish({ type: 'status', state: 'session', targetLang: lang, live: true })
 
     // Azure auth tokens last ~10 minutes; refresh well inside that. Soniox
     // keys are only used at connect time, so its driver has nothing to refresh.
     clearInterval(tokenTimer)
-    if (driver.refreshCredential) {
+    if (drivers.some((d) => d.refreshCredential)) {
       tokenTimer = setInterval(async () => {
         try {
-          await driver.refreshCredential(await fetchToken())
+          const fresh = await fetchToken()
+          for (const d of drivers) if (d.refreshCredential) await d.refreshCredential(fresh)
           log('auth token refreshed')
         } catch (err) {
           log('token refresh failed: ' + err.message)
@@ -279,12 +310,17 @@ if (window.SPEECH_SDK_FALLBACK && (new URLSearchParams(location.search).get('pro
 
   // ---- Azure driver --------------------------------------------------------
 
-  async function azureDriver(cfg, deviceId, h) {
+  async function azureDriver(cfg, targetLangs, deviceId, handlersFor) {
     const S = window.SpeechSDK
     if (!S) throw new Error('Speech SDK failed to load (no local bundle and no internet).')
 
+    // One handler set per language, so the driver interface stays identical to
+    // Soniox's from the caller's point of view.
+    const H = new Map(targetLangs.map((l) => [l, handlersFor(l)]))
+    const anyLog = (m) => H.get(targetLangs[0]).onLog(m)
+
     const speechConfig = S.SpeechTranslationConfig.fromAuthorizationToken(cfg.token, cfg.region)
-    speechConfig.addTargetLanguage(cfg.targetLanguage)
+    for (const l of targetLangs) speechConfig.addTargetLanguage(l)
     // Continuous LID: speakers switch between Tamil, Hindi and English mid-talk
     // and no operator should have to notice.
     speechConfig.setProperty(S.PropertyId.SpeechServiceConnection_LanguageIdMode, 'Continuous')
@@ -297,36 +333,38 @@ if (window.SPEECH_SDK_FALLBACK && (new URLSearchParams(location.search).get('pro
     if (cfg.phraseList && cfg.phraseList.length) {
       const grammar = S.PhraseListGrammar.fromRecognizer(recognizer)
       cfg.phraseList.forEach((p) => grammar.addPhrase(p))
-      h.onLog(`phrase list: ${cfg.phraseList.length} entries`)
+      anyLog(`phrase list: ${cfg.phraseList.length} entries`)
     }
 
-    const target = cfg.targetLanguage
     const detected = (e) => {
       try {
         return S.AutoDetectSourceLanguageResult.fromResult(e.result).language || null
       } catch { return null }
     }
 
-    recognizer.recognizing = (_s, e) => {
-      h.onEvent()
-      const text = e.result.translations && e.result.translations.get(target)
-      if (text) h.onPartial(text, detected(e))
+    // Azure returns one translation per target from a single recognition, so
+    // every language is fed from the same event — they cannot drift apart.
+    const fanOut = (e, method) => {
+      const src = detected(e)
+      for (const l of targetLangs) {
+        const h = H.get(l)
+        h.onEvent()
+        const text = e.result.translations && e.result.translations.get(l)
+        if (text) h[method](text, src)
+      }
     }
 
-    recognizer.recognized = (_s, e) => {
-      h.onEvent()
-      const text = e.result.translations && e.result.translations.get(target)
-      if (text) h.onFinal(text, detected(e))
-    }
+    recognizer.recognizing = (_s, e) => fanOut(e, 'onPartial')
+    recognizer.recognized = (_s, e) => fanOut(e, 'onFinal')
 
     recognizer.canceled = (_s, e) => {
-      h.onLog(`canceled: ${e.errorDetails || e.reason}`)
-      h.onRetry('canceled — restarting')
+      anyLog(`canceled: ${e.errorDetails || e.reason}`)
+      H.get(targetLangs[0]).onRetry('canceled — restarting')
     }
 
     recognizer.sessionStopped = () => {
-      h.onLog('session stopped')
-      h.onRetry('sessionStopped')
+      anyLog('session stopped')
+      H.get(targetLangs[0]).onRetry('sessionStopped')
     }
 
     await new Promise((resolve, reject) => recognizer.startContinuousRecognitionAsync(resolve, reject))
@@ -357,7 +395,7 @@ if (window.SPEECH_SDK_FALLBACK && (new URLSearchParams(location.search).get('pro
     }
   }
 
-  async function sonioxDriver(cfg, deviceId, h) {
+  async function sonioxDriver(cfg, targetLang, stream, h) {
     const { SonioxClient } = await loadSonioxSdk()
 
     // Soniox streams tokens, not lines: finals arrive once and accumulate,
@@ -369,6 +407,25 @@ if (window.SPEECH_SDK_FALLBACK && (new URLSearchParams(location.search).get('pro
     let finalBuffer = ''
     let lastLang = null
     let stopped = false
+
+    // THE RULE that makes every language stream stay live whatever is spoken.
+    //
+    // A one_way session with target L emits `translation` tokens while the
+    // speaker is in some other language. The moment they switch INTO L there is
+    // nothing left to translate, so Soniox emits `original` tokens instead. Take
+    // both: translations always, and originals only when they are already in
+    // this session's language. Anything else is the untranslated source, which
+    // has a translated counterpart and would double the line.
+    //
+    // This also handles mid-sentence code-switching for free: in a Tamil-then-
+    // English sentence the `en` session takes translated text for the Tamil half
+    // and original text for the English half, and `ta` does the mirror image.
+    const base = (code) => String(code || '').toLowerCase().split(/[-_]/)[0]
+    const target = base(targetLang)
+    const keep = (t) => {
+      if (t.translation_status === 'translation') return true
+      return base(t.language || t.source_language) === target
+    }
 
     const flush = () => {
       const text = finalBuffer.trim()
@@ -401,8 +458,7 @@ if (window.SPEECH_SDK_FALLBACK && (new URLSearchParams(location.search).get('pro
           // Control tokens carry no text and must never reach a wall.
           if (t.text === '<end>') { endpoint = true; continue }
           if (t.text === '<fin>') continue
-          // Screens are English-only — the untranslated original is noise.
-          if (t.translation_status && t.translation_status !== 'translation') continue
+          if (!keep(t)) continue
           if (t.source_language || t.language) lastLang = t.source_language || t.language
           if (t.is_final) finalBuffer += t.text
           else nonFinal += t.text
@@ -422,15 +478,11 @@ if (window.SPEECH_SDK_FALLBACK && (new URLSearchParams(location.search).get('pro
       languageHints: cfg.languageHints,
       enableLanguageIdentification: true,
       enableEndpointDetection: true,
-      translation: { type: 'one_way', target_language: cfg.targetLanguage },
+      translation: { type: 'one_way', target_language: targetLang },
       ...(cfg.context ? { context: cfg.context } : {}),
-      // Match the level meter's constraints so what AV sees is what we send.
-      audioConstraints: {
-        deviceId: { exact: deviceId },
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
+      // Every language session shares one already-open microphone stream, so
+      // there is no second permission prompt and no device contention.
+      stream,
     })
 
     if (cfg.context && cfg.context.terms) h.onLog(`context terms: ${cfg.context.terms.length}`)
@@ -443,20 +495,76 @@ if (window.SPEECH_SDK_FALLBACK && (new URLSearchParams(location.search).get('pro
     }
   }
 
-  function paint(partial, isPartial) {
-    const html = finals.map((t) => `<div class="fin">${escapeHtml(t)}</div>`)
-    if (isPartial && partial) html.push(`<div class="par">${escapeHtml(partial)}</div>`)
-    $('monitor').innerHTML = html.join('')
+  // ---- per-language monitors ------------------------------------------------
+  //
+  // A hall minder must be able to see that BOTH languages are producing, not
+  // just that "captions are working". One panel per language, side by side.
+
+  const LANG_NAMES = { en: 'English', ta: 'தமிழ் Tamil', hi: 'हिन्दी Hindi' }
+  const langState = new Map() // lang -> { finals: [], lastTs }
+
+  function buildMonitors(langs) {
+    langState.clear()
+    $('monitors').innerHTML = langs.map((l) => `
+      <div class="lang" data-lang="${l}">
+        <div class="langhead">
+          <span class="dot" data-ldot></span>
+          <span class="langname">${escapeHtml(LANG_NAMES[l] || l)}</span>
+          <span class="langage" data-lage>waiting</span>
+        </div>
+        <div class="langtext" data-ltext><em>no captions yet</em></div>
+      </div>`).join('')
+    for (const l of langs) langState.set(l, { finals: [], lastTs: 0 })
   }
+
+  const langEl = (l, sel) => document.querySelector(`.lang[data-lang="${l}"] [${sel}]`)
+
+  function markLang(l) {
+    const s = langState.get(l)
+    if (s) s.lastTs = Date.now()
+  }
+
+  function paintLang(l, text, isPartial) {
+    const s = langState.get(l)
+    if (!s) return
+    if (!isPartial) {
+      s.finals.push(text)
+      if (s.finals.length > 4) s.finals.shift()
+    }
+    const html = s.finals.map((t) => `<div class="fin">${escapeHtml(t)}</div>`)
+    if (isPartial && text) html.push(`<div class="par">${escapeHtml(text)}</div>`)
+    const el = langEl(l, 'data-ltext')
+    if (el) el.innerHTML = html.join('') || '<em>no captions yet</em>'
+  }
+
+  // A language that has gone quiet while the other keeps running is the exact
+  // failure this whole panel exists to surface.
+  setInterval(() => {
+    for (const [l, s] of langState) {
+      const dot = langEl(l, 'data-ldot')
+      const age = langEl(l, 'data-lage')
+      if (!dot || !age) continue
+      if (!running || !s.lastTs) { dot.className = 'dot'; age.textContent = running ? 'waiting' : 'idle'; continue }
+      const secs = Math.round((Date.now() - s.lastTs) / 1000)
+      dot.className = 'dot ' + (secs > 25 ? 'err' : secs > 10 ? 'warn' : 'live')
+      age.textContent = secs < 2 ? 'flowing' : `${secs}s ago`
+    }
+  }, 1000)
 
   const escapeHtml = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
 
   async function stopRecognizer() {
     clearInterval(tokenTimer)
-    if (!driver) return
-    const d = driver
-    driver = null
-    try { await d.stop() } catch (err) { log('stop failed: ' + err.message) }
+    const list = drivers.splice(0)
+    // All languages go down together. A partial teardown that leaves English
+    // live and Tamil dead is worse than a two-second gap in both.
+    for (const d of list) {
+      try { await d.stop() } catch (err) { log('stop failed: ' + err.message) }
+    }
+    if (sharedStream) {
+      sharedStream.getTracks().forEach((t) => t.stop())
+      sharedStream = null
+    }
   }
 
   let restarting = false
